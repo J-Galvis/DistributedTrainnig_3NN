@@ -32,8 +32,8 @@ from Utils.DatasetHandling import cargar_mnist, preprocesar, particionar_dataset
 from Utils.Fuctions import forward, backward, cross_entropy, precision, predecir
 from Utils.WeightsHandling import inicializar_pesos, actualizar_pesos
 from Utils.ModelPersistence import guardar_modelo
-from Utils.Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
-from Utils.messageHandling import send_message, receive_message
+from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
+from messageHandling import send_message, receive_message
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN DEL SERVIDOR
@@ -301,21 +301,22 @@ class DistributedTrainingServer:
         y_pred_test = predecir(self.X_test, self.W1, self.b1, self.W2, self.b2)
         acc_test = precision(y_pred_test, self.y_test)
         
-        self.historial_intervalo_epochs.append(epoch)
-        self.historial_intervalo_times.append(round(tiempo_actual, 6))
-        self.historial_intervalo_acc_train.append(round(acc_train, 6))
-        self.historial_intervalo_loss.append(round(loss, 6))
+        if epoch % self.intervalo_log == 0 or epoch == 1:
+            self.historial_intervalo_epochs.append(epoch)
+            self.historial_intervalo_times.append(round(tiempo_actual, 6))
+            self.historial_intervalo_acc_train.append(round(acc_train, 6))
+            self.historial_intervalo_loss.append(round(loss, 6))
             
-        print(f"\n  {'─'*68}")
-        print(f"  EVALUACIÓN GLOBAL — ÉPOCA {epoch}/{self.epocas}")
-        print(f"  {'─'*68}")
+            print(f"\n  {'─'*68}")
+            print(f"  EVALUACIÓN GLOBAL — ÉPOCA {epoch}/{self.epocas}")
+            print(f"  {'─'*68}")
 
-        
-        print(f"  {'─'*68}")
-        print(f"    ✓ GLOBAL → Loss: {loss:.4f} │ "
-                f"Acc Train: {acc_train:.1f}% │ "
-                f"Acc Test: {acc_test:.1f}%")
-        print(f"    ⏱ Tiempo acumulado: {tiempo_actual:.2f}s")
+            
+            print(f"  {'─'*68}")
+            print(f"    ✓ GLOBAL → Loss: {loss:.4f} │ "
+                    f"Acc Train: {acc_train:.1f}% │ "
+                    f"Acc Test: {acc_test:.1f}%")
+            print(f"    ⏱ Tiempo acumulado: {tiempo_actual:.2f}s")
     
     def shutdown(self):
         """Cierra todas las conexiones de workers."""

@@ -143,24 +143,47 @@ def load_from_paths(*paths: str) -> dict[str, dict]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def runs_to_dataframe(runs: dict[str, dict]) -> pd.DataFrame:
-    """
-    Flatten *runs* into a single tidy ``pd.DataFrame`` (one row per epoch
-    per model).
-
-    Columns: ``model``, ``epoch``, ``time_s``, ``acc_train``, ``loss``
-    """
     frames = []
+
+    def safe_list(x):
+        return x if isinstance(x, list) else []
+
     for name, data in runs.items():
         info = data.get("info_extra", {})
+
+        epoch = safe_list(info.get("historial_intervalo_epochs"))
+        time  = safe_list(info.get("historial_intervalo_times"))
+        acc   = safe_list(info.get("historial_intervalo_acc_train"))
+        loss  = safe_list(info.get("historial_intervalo_loss"))
+
+        print(f"[DEBUG] {name} → "
+              f"epoch={len(epoch)}, time={len(time)}, "
+              f"acc={len(acc)}, loss={len(loss)}")
+
+        # 🔥 IGNORAR loss si está vacío
+        if len(loss) == 0:
+            min_len = min(len(epoch), len(time), len(acc))
+            loss = [None] * min_len  # rellenar con NaN
+        else:
+            min_len = min(len(epoch), len(time), len(acc), len(loss))
+
+        if min_len == 0:
+            print(f"[WARNING] Skipping '{name}' (no usable data)")
+            continue
+
         frames.append(pd.DataFrame({
-            "model"    : name,
-            "epoch"    : info.get("historial_intervalo_epochs",    []),
-            "time_s"   : info.get("historial_intervalo_times",     []),
-            "acc_train": info.get("historial_intervalo_acc_train", []),
-            "loss"     : info.get("historial_intervalo_loss",      []),
+            "model"    : [name] * min_len,
+            "epoch"    : epoch[:min_len],
+            "time_s"   : time[:min_len],
+            "acc_train": acc[:min_len],
+            "loss"     : loss[:min_len],
         }))
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    print(f"[DEBUG] Final dataframe shape: {df.shape}")
+
+    return df
 
 
 def runs_metadata(runs: dict[str, dict]) -> pd.DataFrame:
@@ -200,6 +223,7 @@ def compare_runs(
     runs: dict[str, dict],
     keys: Optional[list[str]] = None,
     save_html: Optional[str] = None,
+    loose: bool = True,
 ) -> alt.VConcatChart:
     """
     Parameters
@@ -295,7 +319,9 @@ def compare_runs(
     )
 
     # ── Chart C – Loss vs Epochs  (small, right) ─────────────────────────────
-    chart_loss_epoch = (
+    
+    if loose:
+        chart_loss_epoch = (
         alt.Chart(df)
         .mark_line(point=alt.OverlayMarkDef(size=20, opacity=0.5))
         .encode(
@@ -310,15 +336,24 @@ def compare_runs(
             height=_H_SMALL,
         )
         .add_params(zoom_c)
-    )
+        )
+
+   
 
     # ── Compose layout ────────────────────────────────────────────────────────
     #   Row 1 → Chart A  (full width)
     #   Row 2 → Chart B | Chart C  (side by side, independent Y axes)
-    bottom_row = (
-        alt.hconcat(chart_acc_epoch, chart_loss_epoch)
-        .resolve_scale(color="shared", y="independent")
-    )
+    if loose:
+        bottom_row = (
+            alt.hconcat(chart_acc_epoch, chart_loss_epoch)
+            .resolve_scale(color="shared", y="independent")
+        )
+    
+    else:
+        bottom_row = (
+            alt.hconcat(chart_acc_epoch)
+            .resolve_scale(color="shared", y="independent")
+        )
 
     combined = (
         alt.vconcat(chart_epoch_time , bottom_row)
