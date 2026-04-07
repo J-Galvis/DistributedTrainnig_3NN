@@ -1,19 +1,50 @@
+"""
+=============================================================================
+  SERVIDOR — ENTRENAMIENTO NEURONAL DISTRIBUIDO CON SOCKETS
+=============================================================================
+
+El servidor:
+1. Carga y particiona el dataset CIFAR10 en K particiones
+2. Abre un socket servidor esperando conexiones de workers
+3. Para cada época:
+   - Envía a cada worker: epoch, batch_ids, pesos globales, learning_rate, init/stop signal
+   - Recibe de cada worker: gradientes calculados
+   - Promedia los gradientes
+   - Actualiza los pesos globales
+4. Al final, evaluación en test
+=============================================================================
+"""
+
+import sys
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-import torch.optim as optim
-import torch.nn as nn
 import socket
-import pickle
-import torch
 import time
 import csv
-import os
+from typing import Dict, List
 
-from defineNetwork import Net, TRANSFORM, NUM_WORKERS, NUM_EPOCHS, SAVE_FILE, TRAINLOADER, PORT, HOST
+# Agregar el directorio padre al path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-def testingNetwork( testloader, net):
+from defineNetwork import Net, TRANSFORM, NUM_EPOCHS, SAVE_FILE, TRAINLOADER, PORT, HOST
+from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
+from messageHandling import send_message, receive_message
+
+# Configuración
+NUM_WORKERS = TrainingConfig.num_workers
+LEARNING_RATE = TrainingConfig.learning_rate
+INTERVALO_LOG = TrainingConfig.intervalo_log
+SOCKET_TIMEOUT = TrainingConfig.socket_timeout
+
+def testingNetwork(testloader, net):
+    """Evalúa el modelo en el dataset de prueba"""
     correct = 0
     total = 0
+    net.eval()
     with torch.no_grad():
         for data in testloader:
             images, labels = data
@@ -23,225 +54,326 @@ def testingNetwork( testloader, net):
             correct += (predicted == labels).sum().item()
     return (100 * correct / total)
 
-def send_model_params(sock, model):
-    """Send current model parameters to worker (parameters only)"""
-    try:
-        params = {name: param.data.cpu().numpy() for name, param in model.named_parameters()}
-        data = pickle.dumps(params)
-        sock.sendall(len(data).to_bytes(4, 'big') + data)
-        return True
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
-        print(f"Connection error while sending parameters: {e}")
-        return False
-
-def send_batch_list(sock, batch_list):
-    """Send list of batch IDs to worker for the epoch"""
-    try:
-        data = pickle.dumps(batch_list)
-        sock.sendall(len(data).to_bytes(4, 'big') + data)
-        return True
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
-        print(f"Connection error while sending batch list: {e}")
-        return False
-
-def receive_gradients(sock):
-    """Receive accumulated gradients from worker after epoch"""
-    try:
-        grad_len = int.from_bytes(sock.recv(4), 'big')
-        grad_data = b''
-        while len(grad_data) < grad_len:
-            chunk = sock.recv(min(grad_len - len(grad_data), 4096))
-            if not chunk:
-                raise ConnectionError("Connection closed while receiving data")
-            grad_data += chunk
-        return pickle.loads(grad_data)
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
-        print(f"Connection error while receiving gradients: {e}")
-        return None
-
 def accuracyTest(net, transform, num_workers):
-    print("starting testing . . . ")
+    """Carga el dataset de prueba y evalúa"""
+    print("Starting testing...")
     testset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
     testloader = torch.utils.data.DataLoader(testset, batch_size=32, shuffle=False, num_workers=num_workers)
     return testingNetwork(testloader, net)
 
-def start_server():
-    num_workers = NUM_WORKERS
-
-    net = Net()
-
-    optimizer = optim.AdamW(net.parameters(), lr=0.001, weight_decay=1e-2, 
-                           betas=(0.9, 0.999), eps=1e-8)
+class DistributedTrainingServer:
+    """
+    Servidor de Entrenamiento Distribuido CIFAR10.
     
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, 
-        max_lr=0.01,
-        epochs=NUM_EPOCHS,
-        steps_per_epoch=len(TRAINLOADER),
-        pct_start=0.3,
-        div_factor=10,
-        final_div_factor=100
-    )
-
-    # Initialize CSV files for time tracking
-    results_dir = './Results'
-    os.makedirs(results_dir, exist_ok=True)
+    Maneja conexiones de múltiples workers y coordina el entrenamiento federado.
+    """
     
-    server_time_file = os.path.join(results_dir, 'Server time.csv')
+    def __init__(self, host, port, num_workers, epocas, learning_rate):
+        self.host = host
+        self.port = port
+        self.num_workers = num_workers
+        self.epocas = epocas
+        self.learning_rate = learning_rate
+        
+        # Modelo
+        self.net = Net()
+        self.optimizer = optim.AdamW(self.net.parameters(), lr=learning_rate, weight_decay=1e-2,
+                                     betas=(0.9, 0.999), eps=1e-8)
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=0.01,
+            epochs=epocas,
+            steps_per_epoch=len(TRAINLOADER),
+            pct_start=0.3,
+            div_factor=10,
+            final_div_factor=100
+        )
+        
+        # Conexiones de workers
+        self.worker_sockets: Dict[int, socket.socket] = {}
+        self.worker_connected = {}
+        
+        # Datos
+        self.total_batches = len(TRAINLOADER)
+        
+        # Historial
+        self.historial_epochs = []
+        self.historial_times = []
+        self.historial_accuracies = []
     
-    # Get the total number of batches
-    total_batches = len(TRAINLOADER)
-
-    # Start server
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen()
-    print(f'Server listening on {HOST}:{PORT}')
-
-    worker_sockets = []
-    for i in range(num_workers):
-        conn, addr = server_socket.accept()
-        print(f'Worker {i+1} connected from {addr}')
-        worker_sockets.append(conn)
-
-    # Send initial model parameters to all workers
-    print("Sending initial model parameters to workers...")
-    active_workers = []
-    for i, ws in enumerate(worker_sockets):
-        if send_model_params(ws, net):
-            active_workers.append(ws)
-            print(f"Successfully sent parameters to worker {i+1}")
-        else:
-            print(f"Failed to send parameters to worker {i+1}, removing from active workers")
-            ws.close()
-
-    if not active_workers:
-        print("No active workers available. Exiting...")
-        server_socket.close()
-        exit(1)
-
-    print(f"Training with {len(active_workers)} active workers")
-
-    # Training loop
-    net_training_start = time.time()
-
-    for epoch in range(NUM_EPOCHS):
-        epoch_start_time = time.time()
-        print(f'Epoch {epoch+1}')
+    def setup_socket_server(self):
+        """Configura el socket servidor."""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(self.num_workers)
+        self.server_socket.settimeout(SOCKET_TIMEOUT)
         
-        # Distribute batches among workers for this epoch
-        batches_per_worker = total_batches // len(active_workers)
-        remaining_batches = total_batches % len(active_workers)
-        
-        workers_to_remove = []
-        
-        # Send batch assignments to each worker
-        batch_start = 0
-        for i, ws in enumerate(active_workers):
-            # Calculate how many batches this worker gets
-            worker_batch_count = batches_per_worker + (1 if i < remaining_batches else 0)
-            worker_batch_list = list(range(batch_start, batch_start + worker_batch_count))
-            batch_start += worker_batch_count
-            
-            if send_batch_list(ws, worker_batch_list):
-                print(f"Sent {len(worker_batch_list)} batches to worker {i+1}")
-            else:
-                print(f"Failed to send batch list to worker {i+1}, removing from active workers")
-                workers_to_remove.append(i)
-                ws.close()
-        
-        # Remove disconnected workers
-        for i in reversed(workers_to_remove):
-            active_workers.pop(i)
-        
-        if not active_workers:
-            print("All workers disconnected. Stopping training...")
-            break
-        
-        print(f"Waiting for accumulated gradients from {len(active_workers)} workers...")
-        successful_gradients = []
-        workers_to_remove = []
-        
-        for i, ws in enumerate(active_workers):
-            worker_grads = receive_gradients(ws)
-            if worker_grads is not None:
-                successful_gradients.append(worker_grads)
-                print(f"Received accumulated gradients from worker {i+1}")
-            else:
-                print(f"Failed to receive gradients from worker {i+1}")
-                workers_to_remove.append(i)
-                ws.close()
-        
-        
-        # Remove workers that failed to send gradients
-        for i in reversed(workers_to_remove):
-            active_workers.pop(i)
-        
-        # Average gradients and update model (once per epoch)
-        if successful_gradients:
-            optimizer.zero_grad()
-            
-            # Average gradients from all successful workers
-            num_workers = len(successful_gradients)
-            for param_idx, param in enumerate(net.parameters()):
-                if param_idx < len(successful_gradients[0]):
-                    # Average gradients from all successful workers for this parameter
-                    avg_grad = sum(torch.tensor(grads[param_idx], device=param.device, dtype=param.dtype) 
-                                 for grads in successful_gradients) / num_workers
-                    param.grad = avg_grad
-            
-            # Apply gradient clipping before optimizer step
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-            
-            # Update model parameters
-            optimizer.step()
-            scheduler.step()
-            
-            print(f"Model updated after epoch {epoch+1} using {num_workers} workers")
-            
-            # Send updated parameters to remaining workers for next epoch
-            if epoch < NUM_EPOCHS - 1:  # Don't send if this is the last epoch
-                workers_to_remove = []
-                for i, ws in enumerate(active_workers):
-                    if not send_model_params(ws, net):
-                        print(f"Failed to send updated parameters to worker {i+1}")
-                        workers_to_remove.append(i)
-                        ws.close()
+        print(f"\n{'='*70}")
+        print(f"  SERVIDOR DISTRIBUIDO — ESCUCHANDO EN {self.host}:{self.port}")
+        print(f"{'='*70}")
+        print(f"  Esperando {self.num_workers} conexiones de workers...")
+    
+    def wait_for_workers(self):
+        """
+        Espera a que se conecten todos los workers.
+        Asigna worker_id basado en el orden de conexión.
+        Envía mensaje de sincronización inicial a cada worker.
+        """
+        # FASE 1: Aceptar todas las conexiones
+        for worker_id in range(self.num_workers):
+            try:
+                print(f"\n  [Esperando] Worker {worker_id}...")
+                client_socket, client_address = self.server_socket.accept()
+                client_socket.settimeout(SOCKET_TIMEOUT)
                 
-                # Remove workers that couldn't receive updates
-                for i in reversed(workers_to_remove):
-                    active_workers.pop(i)
+                self.worker_sockets[worker_id] = client_socket
+                self.worker_connected[worker_id] = True
+                
+                print(f"  ✓ Worker {worker_id} conectado desde {client_address}")
+                
+            except socket.timeout:
+                print(f"\n  ✗ Timeout esperando worker {worker_id}")
+                raise
+            except Exception as e:
+                print(f"\n  ✗ Error aceptando conexión: {e}")
+                raise
         
-        # Calculate total epoch time
-        total_epoch_time = time.time() - epoch_start_time
-        epoch_training_total = time.time() - net_training_start
-
-        Accuracy = accuracyTest(net, TRANSFORM, num_workers)
+        # FASE 2: Enviar mensaje de sincronización a todos los workers
+        print(f"\n  {'─'*68}")
+        print(f"  FASE DE SINCRONIZACIÓN — Enviando señales de inicio a workers")
+        print(f"  {'─'*68}")
         
-        # Log server epoch time
-        with open(server_time_file, 'a', newline='') as f:
+        for worker_id in range(self.num_workers):
+            try:
+                # Crear mensaje de sincronización (epoch=0, init_signal=True)
+                params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
+                message = MessageFromServer(
+                    batch_ids=[],
+                    epoch=0,
+                    init_signal=True,
+                    stop_signal=False,
+                    learning_rate=self.learning_rate,
+                    params=params
+                )
+                
+                # Enviar mensaje de sincronización
+                sock = self.worker_sockets[worker_id]
+                send_message(sock, message)
+                
+                print(f"    → Sincronización enviada a worker {worker_id}")
+                
+            except Exception as e:
+                print(f"    ✗ Error sincronizando worker {worker_id}: {e}")
+                raise
+        
+        # FASE 3: Esperar confirmación (handshake) de todos los workers
+        print(f"\n  {'─'*68}")
+        print(f"  FASE DE HANDSHAKE — Esperando confirmación de workers")
+        print(f"  {'─'*68}")
+        
+        for worker_id in range(self.num_workers):
+            try:
+                sock = self.worker_sockets[worker_id]
+                ready_msg = receive_message(sock)
+                
+                print(f"    ✓ Worker {worker_id} listo (dataset_size={ready_msg.dataset_size})")
+                
+            except Exception as e:
+                print(f"    ✗ Error esperando confirmación de worker {worker_id}: {e}")
+                raise
+        
+        print(f"  ✓ Todos los workers sincronizados y listos para entrenar")
+    
+    def distribute_work(self, epoch):
+        """
+        Distribuye trabajo a todos los workers para una época.
+        
+        Envía a cada worker: epoch, batch_ids, pesos globales, learning_rate, etc.
+        """
+        print(f"\n  {'─'*68}")
+        print(f"  ÉPOCA {epoch}/{self.epocas} — DISTRIBUYENDO TRABAJO A WORKERS")
+        print(f"  {'─'*68}")
+        
+        # Calcular distribución de batches entre workers
+        batches_per_worker = self.total_batches // self.num_workers
+        remaining_batches = self.total_batches % self.num_workers
+        
+        for worker_id in range(self.num_workers):
+            try:
+                # Calcular batches para este worker
+                batch_count = batches_per_worker + (1 if worker_id < remaining_batches else 0)
+                batch_start = worker_id * batches_per_worker + min(worker_id, remaining_batches)
+                batch_ids = list(range(batch_start, batch_start + batch_count))
+                
+                # Obtener parámetros actuales del modelo
+                params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
+                
+                # Crear mensaje para el worker
+                message = MessageFromServer(
+                    batch_ids=batch_ids,
+                    epoch=epoch,
+                    init_signal=(epoch == 1),
+                    stop_signal=(epoch == self.epocas),
+                    learning_rate=self.learning_rate,
+                    params=params
+                )
+                
+                # Enviar al worker
+                sock = self.worker_sockets[worker_id]
+                send_message(sock, message)
+                
+                print(f"    ✓ Enviado a worker {worker_id}: epoch={epoch}, batches={len(batch_ids)}")
+                
+            except Exception as e:
+                print(f"    ✗ Error enviando a worker {worker_id}: {e}")
+                raise
+    
+    def collect_results(self):
+        """
+        Recolecta resultados de todos los workers para la época actual.
+        
+        Recibe gradientes y métricas de cada worker.
+        """
+        print(f"\n  {'─'*68}")
+        print(f"  RECOLECTANDO RESULTADOS DE WORKERS")
+        print(f"  {'─'*68}")
+        
+        all_messages = []
+        
+        for worker_id in range(self.num_workers):
+            try:
+                sock = self.worker_sockets[worker_id]
+                message = receive_message(sock)
+                
+                all_messages.append(message)
+                print(f"    ✓ Worker {worker_id}: {message}")
+                
+            except Exception as e:
+                print(f"    ✗ Error recibiendo de worker {worker_id}: {e}")
+                raise
+        
+        return all_messages
+    
+    def average_gradients(self, messages_list):
+        """
+        Promedia los gradientes de todos los workers.
+        
+        Retorna:
+            Dict con gradientes promediados para cada parámetro
+        """
+        num_workers = len(messages_list)
+        
+        # Inicializar diccionario de gradientes promediados
+        avg_grads = {}
+        
+        # Iterar sobre todas las claves de parámetros del primer worker
+        if num_workers > 0:
+            for param_name in messages_list[0].gradients.keys():
+                # Promediar este parámetro de todos los workers
+                grads_list = [msg.gradients[param_name] for msg in messages_list]
+                avg_grads[param_name] = sum(grads_list) / num_workers
+        
+        return avg_grads
+    
+    def update_model(self, avg_grads):
+        """
+        Actualiza los pesos del modelo usando los gradientes promediados.
+        """
+        self.optimizer.zero_grad()
+        
+        # Asignar gradientes a los parámetros
+        for name, param in self.net.named_parameters():
+            if name in avg_grads:
+                param.grad = torch.tensor(avg_grads[name], dtype=param.dtype, device=param.device)
+        
+        # Aplicar clipping
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+        
+        # Actualizar pesos
+        self.optimizer.step()
+        self.scheduler.step()
+    
+    def training_loop(self):
+        """
+        Bucle principal de entrenamiento.
+        """
+        print(f"\n{'='*70}")
+        print(f"  INICIANDO ENTRENAMIENTO DISTRIBUIDO")
+        print(f"{'='*70}\n")
+        
+        training_start = time.time()
+        
+        # Crear directorio de resultados
+        results_dir = './Results'
+        os.makedirs(results_dir, exist_ok=True)
+        
+        server_time_file = os.path.join(results_dir, 'Server_time.csv')
+        
+        # Escribir encabezado del CSV
+        with open(server_time_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([epoch+1, f"{total_epoch_time:.4f}",  f"{epoch_training_total:.4f}", len(active_workers), f"{Accuracy:.4f}"])
+            writer.writerow(['Epoch', 'Epoch_Time', 'Total_Time', 'Num_Workers', 'Test_Accuracy'])
         
-        if not active_workers:
-            print("No active workers remaining. Stopping training...")
-            break
-            
-        print(f'Epoch {epoch+1} finished with {len(active_workers)} active workers (Time: {total_epoch_time:.4f}s)')
-
-    # Send termination signal to remaining workers
-    print("Sending termination signals to remaining workers...")
-    for ws in active_workers:
         try:
-            ws.sendall(len(b'DONE').to_bytes(4, 'big') + b'DONE')
-        except:
-            pass
-        ws.close()
+            for epoch in range(1, self.epocas + 1):
+                epoch_start = time.time()
+                
+                # Distribuir trabajo
+                self.distribute_work(epoch)
+                
+                # Recolectar resultados
+                messages = self.collect_results()
+                
+                # Promediar gradientes
+                avg_grads = self.average_gradients(messages)
+                
+                # Actualizar modelo
+                self.update_model(avg_grads)
+                
+                epoch_time = time.time() - epoch_start
+                total_time = time.time() - training_start
+                
+                # Evaluar en test (cada INTERVALO_LOG épocas)
+                if epoch % INTERVALO_LOG == 0:
+                    test_acc = accuracyTest(self.net, TRANSFORM, 0)
+                    print(f"\n  Epoch {epoch}: Test Accuracy = {test_acc:.4f}%")
+                else:
+                    test_acc = 0.0
+                
+                # Guardar en CSV
+                with open(server_time_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([epoch, f"{epoch_time:.4f}", f"{total_time:.4f}", self.num_workers, f"{test_acc:.4f}"])
+                
+                print(f"  Epoch {epoch} completada en {epoch_time:.4f}s (Total: {total_time:.4f}s)\n")
+            
+            print(f"\n{'='*70}")
+            print(f"  ENTRENAMIENTO COMPLETADO")
+            print(f"{'='*70}\n")
+            
+            # Guardar modelo
+            torch.save(self.net.state_dict(), SAVE_FILE)
+            print(f"Modelo guardado en {SAVE_FILE}")
+        
+        except Exception as e:
+            print(f"\n✗ Error durante entrenamiento: {e}")
+            raise
+        finally:
+            # Cerrar conexiones
+            for worker_id, sock in self.worker_sockets.items():
+                try:
+                    sock.close()
+                except:
+                    pass
+            self.server_socket.close()
 
-    torch.save(net.state_dict(), SAVE_FILE)
-    server_socket.close()
-    print("Server stopped")
+def start_server():
+    """Inicia el servidor de entrenamiento distribuido"""
+    server = DistributedTrainingServer(HOST, PORT, NUM_WORKERS, NUM_EPOCHS, LEARNING_RATE)
+    server.setup_socket_server()
+    server.wait_for_workers()
+    server.training_loop()
 
 if __name__ == '__main__':
     start_server()

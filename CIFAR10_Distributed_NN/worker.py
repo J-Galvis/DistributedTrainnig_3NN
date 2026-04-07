@@ -1,215 +1,320 @@
-import torch.optim as optim
+"""
+=============================================================================
+  WORKER — ENTRENAMIENTO NEURAL DISTRIBUIDO CON SOCKETS
+=============================================================================
+
+El worker:
+1. Se conecta al servidor
+2. Para cada época recibe:
+   - batch_ids: lista de identificadores de batches
+   - params: parámetros globales del modelo
+   - learning_rate
+   - init_signal / stop_signal
+3. Carga los batches basados en batch_ids
+4. Entrena acumulando gradientes
+5. Envía gradientes acumulados al servidor
+6. Repite hasta recibir stop_signal
+
+El dataset se carga localmente de manera que cada worker puede acceder a cualquier batch.
+=============================================================================
+"""
+
+import sys
+import os
+import torch
 import torch.nn as nn
 import socket
-import pickle
-import torch
+import time
+
+# Agregar el directorio padre al path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from defineNetwork import Net, TRAINLOADER, HOST, PORT
+from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
+from messageHandling import send_message, receive_message
 
-torch.multiprocessing.set_sharing_strategy('file_system')
+# Configuración
+SOCKET_TIMEOUT = TrainingConfig.socket_timeout
 
-def receive_data(sock):
-    """Receive data with length prefix"""
-    try:
-        sock.settimeout(120.0)  # Longer timeout for epoch processing
-        length_bytes = b''
-        while len(length_bytes) < 4:
-            chunk = sock.recv(4 - len(length_bytes))
-            if not chunk:
-                raise ConnectionError("Connection closed while receiving length")
-            length_bytes += chunk
-        
-        data_len = int.from_bytes(length_bytes, 'big')
-        
-        # Receive actual data
-        data = b''
-        while len(data) < data_len:
-            chunk = sock.recv(min(data_len - len(data), 4096))
-            if not chunk:
-                raise ConnectionError("Connection closed while receiving data")
-            data += chunk
-        
-        sock.settimeout(None)
-        return data
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
-        print(f"Connection error while receiving data: {e}")
-        sock.settimeout(None)
-        return None
 
-def send_gradients(sock, gradients):
-    """Send accumulated gradients to server"""
-    try:
-        grad_data = pickle.dumps(gradients)
-        sock.sendall(len(grad_data).to_bytes(4, 'big') + grad_data)
-        return True
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
-        print(f"Connection error while sending gradients: {e}")
-        return False
-
-def update_model_params(model, params_dict):
-    """Update model parameters from server"""
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if name in params_dict:
-                param.data = torch.tensor(params_dict[name], dtype=param.dtype, device=param.device)
-    return
-
-def accumulate_gradients(accumulated_grads, current_grads):
-    """Accumulate gradients from current batch"""
-    if accumulated_grads is None:
-        return [grad.clone() for grad in current_grads]
-    else:
-        for i, grad in enumerate(current_grads):
-            accumulated_grads[i] += grad
-        return accumulated_grads
-                
-def start_worker():
-
-    # Initialize model and criterion (no optimizer/scheduler - workers only compute gradients)
-    net = Net()
-    criterion = nn.CrossEntropyLoss()
-
-    # Prepare batches list to access by index
-    batches = list(TRAINLOADER)
-    print(f"Worker loaded {len(batches)} batches locally")
-
-    # Connect to server
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect((HOST, PORT))
-    print("Connected to server")
-
-    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    net.to(device)
+class DistributedTrainingWorker:
+    """
+    Worker de Entrenamiento Distribuido.
     
-    # Create a dummy optimizer for scaler.unscale_ (required for AMP)
-    if scaler is not None:
-        dummy_optimizer = optim.SGD(net.parameters(), lr=0.01)
-
-    try:
-        # Receive initial model parameters
-        params_data = receive_data(client_socket)
-        if params_data is None:
-            print("Failed to receive initial parameters")
-            return
+    Se conecta al servidor y entrena los batches asignados.
+    """
+    
+    def __init__(self, server_host, server_port):
+        self.server_host = server_host
+        self.server_port = server_port
         
-        initial_params = pickle.loads(params_data)
-        update_model_params(net, initial_params)
-        print("Received and applied initial model parameters")
-
+        # Modelo
+        self.net = Net()
+        self.criterion = nn.CrossEntropyLoss()
+        
+        # Datos
+        self.batches = list(TRAINLOADER)
+        self.worker_id = None
+        
+        # Socket
+        self.socket = None
+        
+        # Configuración de device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.net.to(self.device)
+        
+        # Para AMP (Automatic Mixed Precision)
+        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        
+        print(f"Worker initialized: {len(self.batches)} batches loaded locally")
+    
+    def connect_to_server(self):
+        """Se conecta al servidor."""
+        print(f"\n{'='*70}")
+        print(f"  WORKER — CONECTANDO AL SERVIDOR")
+        print(f"{'='*70}")
+        print(f"  Intentando conectar a {self.server_host}:{self.server_port}...")
+        
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(SOCKET_TIMEOUT)
+            self.socket.connect((self.server_host, self.server_port))
+            print(f"  ✓ Conectado al servidor exitosamente")
+            
+        except ConnectionRefusedError:
+            print(f"  ✗ Conexión rechazada. ¿El servidor está ejecutándose?")
+            raise
+        except socket.timeout:
+            print(f"  ✗ Timeout conectando al servidor")
+            raise
+        except Exception as e:
+            print(f"  ✗ Error conectando: {e}")
+            raise
+    
+    def wait_for_initialization(self):
+        """
+        Espera el mensaje de sincronización inicial del servidor.
+        
+        Actualiza los parámetros del modelo y envía confirmación.
+        """
+        print(f"\n{'='*70}")
+        print(f"  ESPERANDO INICIALIZACIÓN DEL SERVIDOR")
+        print(f"{'='*70}\n")
+        
+        try:
+            # Recibir mensaje de sincronización
+            print(f"  [Worker] Esperando mensaje de sincronización...")
+            message = receive_message(self.socket)
+            
+            if not message.init_signal:
+                raise RuntimeError("Mensaje de sincronización no recibido")
+            
+            print(f"  ✓ Recibido mensaje de sincronización del servidor")
+            
+            # Actualizar parámetros del modelo
+            self.update_model_params(message.params)
+            print(f"  ✓ Parámetros del modelo actualizados")
+            
+            # Enviar confirmación
+            ready_msg = WorkerReadyMessage(
+                worker_id=0,  # Se asignará en el servidor
+                dataset_size=len(self.batches)
+            )
+            send_message(self.socket, ready_msg)
+            print(f"  ✓ Confirmación de listo enviada al servidor")
+            
+        except Exception as e:
+            print(f"  ✗ Error en inicialización: {e}")
+            raise
+    
+    def update_model_params(self, params_dict):
+        """
+        Actualiza los parámetros del modelo desde el servidor.
+        
+        Parámetros:
+            params_dict: Dict con parámetros en formato numpy
+        """
+        with torch.no_grad():
+            for name, param in self.net.named_parameters():
+                if name in params_dict:
+                    param_data = torch.tensor(params_dict[name], dtype=param.dtype, device=param.device)
+                    param.data = param_data
+    
+    def compute_accuracy(self, outputs, labels):
+        """Calcula la precisión"""
+        _, predicted = torch.max(outputs.data, 1)
+        correct = (predicted == labels).sum().item()
+        total = labels.size(0)
+        return 100 * correct / total
+    
+    def train_epoch(self, batch_ids):
+        """
+        Entrena una época con los batches asignados.
+        
+        Acumula gradientes de todos los batches y computa pérdida y precisión.
+        
+        Parámetros:
+            batch_ids: Lista de identificadores de batches
+        
+        Retorna:
+            (gradients_dict, avg_loss, avg_accuracy, training_time)
+        """
+        print(f"    Entrenando con {len(batch_ids)} batches...")
+        
+        tiempo_inicio = time.time()
+        
+        self.net.train()
+        
+        accumulated_grads = {}
+        total_loss = 0.0
+        total_accuracy = 0.0
+        num_samples = 0
+        
+        # Procesamiento de batches
+        for batch_idx in batch_ids:
+            if batch_idx >= len(self.batches):
+                print(f"    ⚠ Warning: batch_id {batch_idx} out of range ({len(self.batches)})")
+                continue
+            
+            inputs, labels = self.batches[batch_idx]
+            inputs = inputs.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+            
+            self.net.zero_grad()
+            
+            # Forward pass
+            if self.scaler is not None:
+                with torch.cuda.amp.autocast():
+                    outputs = self.net(inputs)
+                    loss = self.criterion(outputs, labels)
+                
+                # Backward pass
+                self.scaler.scale(loss).backward()
+                
+                # Unscale para acumulación
+                dummy_optimizer = torch.optim.SGD(self.net.parameters(), lr=0.01)
+                self.scaler.unscale_(dummy_optimizer)
+            else:
+                outputs = self.net(inputs)
+                loss = self.criterion(outputs, labels)
+                loss.backward()
+            
+            # Acumular gradientes
+            for name, param in self.net.named_parameters():
+                if param.grad is not None:
+                    if name not in accumulated_grads:
+                        accumulated_grads[name] = param.grad.detach().cpu().numpy().copy()
+                    else:
+                        accumulated_grads[name] += param.grad.detach().cpu().numpy()
+            
+            # Acumular métricas
+            total_loss += loss.item()
+            accuracy = self.compute_accuracy(outputs, labels)
+            total_accuracy += accuracy * labels.size(0)
+            num_samples += labels.size(0)
+        
+        tiempo_entrenamiento = time.time() - tiempo_inicio
+        
+        avg_loss = total_loss / len(batch_ids) if batch_ids else 0.0
+        avg_accuracy = total_accuracy / num_samples if num_samples > 0 else 0.0
+        
+        print(f"    ✓ Entrenamiento completado: Loss={avg_loss:.4f}, Acc={avg_accuracy:.2f}%")
+        
+        return accumulated_grads, avg_loss, avg_accuracy, tiempo_entrenamiento
+    
+    def training_loop(self):
+        """
+        Bucle principal del worker.
+        
+        Recibe mensajes del servidor, entrena, envía gradientes.
+        Continúa hasta recibir stop_signal.
+        """
+        print(f"\n{'='*70}")
+        print(f"  INICIANDO BUCLE DE ENTRENAMIENTO")
+        print(f"{'='*70}\n")
+        
         epoch_count = 0
         
         while True:
-            # Receive batch list, updated parameters, or termination signal
-            data = receive_data(client_socket)
-            
-            if data is None:
-                print("Connection lost, terminating worker")
-                break
-            
-            # Check for termination signal
-            if data == b'DONE':
-                print("Received termination signal")
-                break
-            
             try:
-                received_data = pickle.loads(data)
+                # Recibir mensaje del servidor
+                print(f"  [Worker] Esperando mensaje del servidor...")
+                message = receive_message(self.socket)
                 
-                # Check if it's updated parameters (dict) or batch list (list)
-                if isinstance(received_data, dict):
-                    # This is updated model parameters
-                    update_model_params(net, received_data)
-                    print("Received and applied updated model parameters")
+                epoch_count += 1
+                
+                print(f"  ✓ Recibido: epoch={message.epoch}, init={message.init_signal}, "
+                      f"stop={message.stop_signal}, batches={len(message.batch_ids)}")
+                
+                # ┌─── HANDSHAKE: Responder a mensaje de sincronización ───┐
+                if message.init_signal and message.epoch == 0:
+                    # Ya manejado en wait_for_initialization
                     continue
-                    
-                elif isinstance(received_data, list):
-                    # This is a list of batch IDs for this epoch
-                    batch_ids = received_data
-                    epoch_count += 1
-                    print(f"Starting epoch {epoch_count}, processing {len(batch_ids)} batches")
-                    
-                    # Set model to training mode
-                    net.train()
-                    
-                    # Initialize gradient accumulator
-                    accumulated_grads = None
-                    total_loss = 0.0
-                    
-                    # Process all batches for this epoch (gradient computation only)
-                    for batch_idx, batch_id in enumerate(batch_ids):
-                        if batch_id >= len(batches):
-                            print(f"Warning: batch_id {batch_id} exceeds available batches ({len(batches)})")
-                            continue
-                            
-                        inputs, labels = batches[batch_id]
-                        inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-
-                        # Zero gradients for this batch
-                        net.zero_grad()
-                        
-                        # Forward pass and loss computation
-                        if scaler is not None:
-                            with torch.cuda.amp.autocast():
-                                outputs = net(inputs)
-                                loss = criterion(outputs, labels)
-                            
-                            # Backward pass to compute gradients
-                            scaler.scale(loss).backward()
-                            
-                            # Unscale gradients for accumulation
-                            scaler.unscale_(dummy_optimizer)
-                            
-                            # Get current gradients (unscaled)
-                            current_grads = [param.grad.clone() if param.grad is not None else torch.zeros_like(param) 
-                                           for param in net.parameters()]
-                        else:
-                            outputs = net(inputs)
-                            loss = criterion(outputs, labels)
-                            
-                            # Backward pass to compute gradients
-                            loss.backward()
-                            
-                            # Get current gradients
-                            current_grads = [param.grad.clone() if param.grad is not None else torch.zeros_like(param) 
-                                           for param in net.parameters()]
-
-                        total_loss += loss.item()
-                        
-                        # Accumulate gradients
-                        accumulated_grads = accumulate_gradients(accumulated_grads, current_grads)
-
-                    print(f"Epoch {epoch_count} completed. Avg loss: {total_loss/len(batch_ids):.4f}")
-                    
-                    # Convert accumulated gradients to numpy and send to server
-                    if accumulated_grads:
-                        final_grads = [grad.cpu().numpy() for grad in accumulated_grads]
-                        
-                        if not send_gradients(client_socket, final_grads):
-                            print("Failed to send accumulated gradients, terminating")
-                            break
-                        print(f"Sent accumulated gradients for epoch {epoch_count}")
-                        
-                    else:
-                        print("No gradients to send")
-                        break
+                # └─────────────────────────────────────────────────┘
                 
-                else:
-                    print(f"Unexpected data type received: {type(received_data)}")
-                    continue
+                # Actualizar parámetros del modelo
+                self.update_model_params(message.params)
+                print(f"    → Parámetros del modelo actualizados (epoch {message.epoch})")
                 
-            except Exception as e:
-                print(f"Error processing received data: {e}")
-                print(f"Raw data length: {len(data) if data else 'None'}")
+                # Entrenar
+                gradients, loss, accuracy, train_time = self.train_epoch(message.batch_ids)
+                
+                # Crear respuesta
+                response = MessageFromWorker(
+                    worker_id=0,
+                    epoch=message.epoch,
+                    gradients=gradients,
+                    loss=loss,
+                    accuracy=accuracy,
+                    training_time=train_time
+                )
+                
+                # Enviar gradientes
+                print(f"    → Enviando gradientes...")
+                send_message(self.socket, response)
+                print(f"    ✓ Gradientes enviados")
+                
+                # Verificar stop signal
+                if message.stop_signal:
+                    print(f"\n  ✓ Stop signal recibido. Terminando worker.")
+                    break
+                
+            except ConnectionError as e:
+                print(f"\n  ✗ Conexión perdida con servidor: {e}")
                 break
+            except socket.timeout:
+                print(f"\n  ✗ Timeout esperando mensaje del servidor")
+                break
+            except Exception as e:
+                print(f"\n  ✗ Error en bucle de entrenamiento: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+    
+    def shutdown(self):
+        """Cierra la conexión."""
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
 
+
+def start_worker():
+    """Inicia el worker de entrenamiento distribuido"""
+    worker = DistributedTrainingWorker(HOST, PORT)
+    
+    try:
+        worker.connect_to_server()
+        worker.wait_for_initialization()
+        worker.training_loop()
+    
     except Exception as e:
-        print(f"Worker error: {e}")
+        print(f"\n✗ Error en worker: {e}")
     finally:
-        try:
-            client_socket.close()
-        except:
-            pass
-        print("Worker disconnected")
+        worker.shutdown()
+        print("\nWorker desconectado")
+
 
 if __name__ == "__main__":
     start_worker()
