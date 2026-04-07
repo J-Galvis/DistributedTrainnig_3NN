@@ -1,31 +1,6 @@
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 import torch.nn.functional as F
-import torch.optim as optim
 import torch.nn as nn
-import platform
 import torch
-import time
-import csv
-import os
-
-HOST = 'localhost'
-PORT = 6000
-
-NUM_WORKERS=1
-NUM_EPOCHS=60
-BATCH_SIZE=32
-
-SAVE_FILE = './Results/cifar10_trained_model.pth'
-
-TRANSFORM = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-])
-
-TRAINSET = datasets.CIFAR10(root='./data', train=True, download=True, transform=TRANSFORM)
-
-TRAINLOADER = torch.utils.data.DataLoader(TRAINSET, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), persistent_workers=(NUM_WORKERS > 0))
 
 class Net(nn.Module):
     def __init__(self):

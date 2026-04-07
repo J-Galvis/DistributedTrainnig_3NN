@@ -92,3 +92,4 @@ class TrainingConfig:
     server_port: int = 6000
     socket_timeout: int = 300  # segundos
     batch_size: int = 32
+    save_file: str = './Results/cifar10_trained_model.pth'

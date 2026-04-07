@@ -24,21 +24,32 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import socket
 import time
-import csv
+import json
+from datetime import datetime
 from typing import Dict, List
+import argparse
 
 # Agregar el directorio padre al path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from defineNetwork import Net, TRANSFORM, NUM_EPOCHS, SAVE_FILE, TRAINLOADER, PORT, HOST
+from defineNetwork import Net
 from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
 from messageHandling import send_message, receive_message
 
-# Configuración
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURACIÓN DEL SERVIDOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Importar constantes desde TrainingConfig
 NUM_WORKERS = TrainingConfig.num_workers
 LEARNING_RATE = TrainingConfig.learning_rate
 INTERVALO_LOG = TrainingConfig.intervalo_log
 SOCKET_TIMEOUT = TrainingConfig.socket_timeout
+SERVER_HOST = TrainingConfig.server_host
+SERVER_PORT = TrainingConfig.server_port
+BATCH_SIZE = TrainingConfig.batch_size
+SAVE_FILE = TrainingConfig.save_file
+NUM_EPOCHS = TrainingConfig.epocas
 
 def testingNetwork(testloader, net):
     """Evalúa el modelo en el dataset de prueba"""
@@ -96,10 +107,11 @@ class DistributedTrainingServer:
         # Datos
         self.total_batches = len(TRAINLOADER)
         
-        # Historial
-        self.historial_epochs = []
-        self.historial_times = []
-        self.historial_accuracies = []
+        # Historial de checkpoints por INTERVALO_LOG
+        self.historial_intervalo_epochs = []      # Épocas en las que se guardó
+        self.historial_intervalo_times = []       # Tiempos acumulados
+        self.historial_intervalo_acc_test = []    # Precisión en test
+        self.historial_intervalo_loss = []        # Loss promedio
     
     def setup_socket_server(self):
         """Configura el socket servidor."""
@@ -294,6 +306,28 @@ class DistributedTrainingServer:
         self.optimizer.step()
         self.scheduler.step()
     
+    def evaluate_global_model(self, epoch, tiempo_actual, test_acc, avg_loss):
+        """
+        Evalúa el modelo global y guarda métricas en historial.
+        
+        Parámetros:
+            epoch: int, número de época actual
+            tiempo_actual: float, tiempo transcurrido desde el inicio del entrenamiento
+            test_acc: float, precisión en test
+            avg_loss: float, pérdida promedio de la época
+        """
+        if epoch % INTERVALO_LOG == 0 or epoch == 1:
+            self.historial_intervalo_epochs.append(epoch)
+            self.historial_intervalo_times.append(round(tiempo_actual, 6))
+            self.historial_intervalo_acc_test.append(round(test_acc, 2))
+            self.historial_intervalo_loss.append(round(avg_loss, 6))
+            
+            print(f"\n  {'─'*68}")
+            print(f"  EVALUACIÓN GLOBAL — ÉPOCA {epoch}/{self.epocas}")
+            print(f"  {'─'*68}")
+            print(f"    ✓ GLOBAL → Loss: {avg_loss:.4f} │ Acc Test: {test_acc:.1f}%")
+            print(f"    ⏱ Tiempo acumulado: {tiempo_actual:.2f}s")
+    
     def training_loop(self):
         """
         Bucle principal de entrenamiento.
@@ -303,17 +337,6 @@ class DistributedTrainingServer:
         print(f"{'='*70}\n")
         
         training_start = time.time()
-        
-        # Crear directorio de resultados
-        results_dir = './Results'
-        os.makedirs(results_dir, exist_ok=True)
-        
-        server_time_file = os.path.join(results_dir, 'Server_time.csv')
-        
-        # Escribir encabezado del CSV
-        with open(server_time_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Epoch', 'Epoch_Time', 'Total_Time', 'Num_Workers', 'Test_Accuracy'])
         
         try:
             for epoch in range(1, self.epocas + 1):
@@ -325,8 +348,9 @@ class DistributedTrainingServer:
                 # Recolectar resultados
                 messages = self.collect_results()
                 
-                # Promediar gradientes
+                # Promediar gradientes y calcular pérdida promedio
                 avg_grads = self.average_gradients(messages)
+                avg_loss = sum(msg.loss for msg in messages) / len(messages) if messages else 0.0
                 
                 # Actualizar modelo
                 self.update_model(avg_grads)
@@ -335,26 +359,23 @@ class DistributedTrainingServer:
                 total_time = time.time() - training_start
                 
                 # Evaluar en test (cada INTERVALO_LOG épocas)
-                if epoch % INTERVALO_LOG == 0:
+                if epoch % INTERVALO_LOG == 0 or epoch == 1:
                     test_acc = accuracyTest(self.net, TRANSFORM, 0)
-                    print(f"\n  Epoch {epoch}: Test Accuracy = {test_acc:.4f}%")
                 else:
                     test_acc = 0.0
                 
-                # Guardar en CSV
-                with open(server_time_file, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([epoch, f"{epoch_time:.4f}", f"{total_time:.4f}", self.num_workers, f"{test_acc:.4f}"])
+                # Registrar métricas en historial
+                self.evaluate_global_model(epoch, total_time, test_acc, avg_loss)
                 
-                print(f"  Epoch {epoch} completada en {epoch_time:.4f}s (Total: {total_time:.4f}s)\n")
+                if epoch % INTERVALO_LOG == 0 or epoch == 1:
+                    print(f"  Epoch {epoch} completada en {epoch_time:.4f}s (Total: {total_time:.4f}s)\n")
             
             print(f"\n{'='*70}")
             print(f"  ENTRENAMIENTO COMPLETADO")
             print(f"{'='*70}\n")
             
-            # Guardar modelo
-            torch.save(self.net.state_dict(), SAVE_FILE)
-            print(f"Modelo guardado en {SAVE_FILE}")
+            # Guardar modelo y metadatos
+            self.save_model_with_metadata(training_start)
         
         except Exception as e:
             print(f"\n✗ Error durante entrenamiento: {e}")
@@ -367,13 +388,126 @@ class DistributedTrainingServer:
                 except:
                     pass
             self.server_socket.close()
+    
+    def save_model_with_metadata(self, training_start):
+        """
+        Guarda el modelo y sus metadatos en formato JSON.
+        """
+        # Crear directorio para stats si no existe
+        stats_dir = './stats'
+        os.makedirs(stats_dir, exist_ok=True)
+        
+        # Calcular tiempo total
+        total_time = time.time() - training_start
+        
+        # Solicitar nombre del modelo
+        model_name = input("\n  Ingrese un nombre para guardar el modelo: ").strip()
+        if not model_name:
+            model_name = f"cifar10_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Guardar pesos del modelo
+        model_path = os.path.join('./modelos_guardados', f"{model_name}.pth")
+        os.makedirs('./modelos_guardados', exist_ok=True)
+        torch.save(self.net.state_dict(), model_path)
+        print(f"\n  ✓ Modelo guardado en: {model_path}")
+        
+        # Preparar metadatos
+        metadata = {
+            'nombre_modelo': model_name,
+            'fecha_guardado': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'arquitectura': 'Distributed CNN with Sockets',
+            'epocas': self.epocas,
+            'learning_rate': self.learning_rate,
+            'num_workers': self.num_workers,
+            'training_time_seconds': round(total_time, 2),
+            'server_host': self.host,
+            'server_port': self.port,
+            'batch_size': BATCH_SIZE,
+            'historial_intervalo_epochs': self.historial_intervalo_epochs,
+            'historial_intervalo_times': self.historial_intervalo_times,
+            'historial_intervalo_acc_test': self.historial_intervalo_acc_test,
+            'historial_intervalo_loss': self.historial_intervalo_loss,
+        }
+        
+        # Guardar metadatos en JSON
+        metadata_path = os.path.join(stats_dir, f"{model_name}_metadata.json")
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+        
+        print(f"  ✓ Metadatos guardados en: {metadata_path}")
 
 def start_server():
     """Inicia el servidor de entrenamiento distribuido"""
-    server = DistributedTrainingServer(HOST, PORT, NUM_WORKERS, NUM_EPOCHS, LEARNING_RATE)
+    server = DistributedTrainingServer(SERVER_HOST, SERVER_PORT, NUM_WORKERS, NUM_EPOCHS, LEARNING_RATE)
     server.setup_socket_server()
     server.wait_for_workers()
     server.training_loop()
 
 if __name__ == '__main__':
+        # permitir pasar parámetros por línea de comandos para el servidor
+    parser = argparse.ArgumentParser(
+        description="Servidor para entrenamiento distribuido."
+    )
+
+    parser.add_argument(
+        "--host",
+        "-H",
+        default=SERVER_HOST,
+        help=f"Host en el que el servidor escuchará (por defecto: {SERVER_HOST})",
+    )
+    parser.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=SERVER_PORT,
+        help=f"Puerto en el que el servidor escuchará (por defecto: {SERVER_PORT})",
+    )
+    parser.add_argument(
+        "--particiones",
+        "-n",
+        type=int,
+        default=NUM_WORKERS,
+        help=f"Número de particiones/datos (por defecto: {NUM_WORKERS})",
+    )
+    parser.add_argument(
+        "--epocas",
+        "-e",
+        type=int,
+        default=NUM_EPOCHS,
+        help=f"Cantidad de épocas para entrenar (por defecto: {NUM_EPOCHS})",
+    )
+    parser.add_argument(
+        "--lr",
+        "--learning-rate",
+        type=float,
+        default=LEARNING_RATE,
+        help=f"Tasa de aprendizaje (por defecto: {LEARNING_RATE})",
+    )
+    parser.add_argument(
+        "--intervalo-log",
+        type=int,
+        default=INTERVALO_LOG,
+        help=f"Intervalo de logging de métricas (por defecto: {INTERVALO_LOG})",
+    )
+
+
+    args = parser.parse_args()
+    SERVER_HOST = args.host
+    SERVER_PORT = args.port
+    NUM_WORKERS = args.particiones
+    NUM_EPOCHS = args.epocas
+    LEARNING_RATE = args.lr
+    INTERVALO_LOG = args.intervalo_log
+
+    # Definir TRANSFORM localmente
+    TRANSFORM = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+    ])
+
+    # Crear dataset y dataloader
+    TRAINSET = datasets.CIFAR10(root='./data', train=True, download=True, transform=TRANSFORM)
+    TRAINLOADER = torch.utils.data.DataLoader(TRAINSET, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), persistent_workers=(NUM_WORKERS > 0))
+
+
     start_server()

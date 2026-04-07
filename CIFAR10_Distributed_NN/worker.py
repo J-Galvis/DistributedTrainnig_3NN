@@ -23,19 +23,25 @@ import sys
 import os
 import torch
 import torch.nn as nn
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
 import socket
 import time
+import argparse
 
 # Agregar el directorio padre al path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from defineNetwork import Net, TRAINLOADER, HOST, PORT
+from defineNetwork import Net
 from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
 from messageHandling import send_message, receive_message
 
 # Configuración
 SOCKET_TIMEOUT = TrainingConfig.socket_timeout
-
+SERVER_HOST = TrainingConfig.server_host
+SERVER_PORT = TrainingConfig.server_port
+BATCH_SIZE = TrainingConfig.batch_size
+NUM_WORKERS = TrainingConfig.num_workers
 
 class DistributedTrainingWorker:
     """
@@ -302,7 +308,7 @@ class DistributedTrainingWorker:
 
 def start_worker():
     """Inicia el worker de entrenamiento distribuido"""
-    worker = DistributedTrainingWorker(HOST, PORT)
+    worker = DistributedTrainingWorker(SERVER_HOST, SERVER_PORT)
     
     try:
         worker.connect_to_server()
@@ -317,4 +323,46 @@ def start_worker():
 
 
 if __name__ == "__main__":
+        # permitir pasar parámetros por línea de comandos para el servidor
+    parser = argparse.ArgumentParser(
+        description="Worker para entrenamiento distribuido."
+    )
+
+    parser.add_argument(
+        "--host",
+        "-H",
+        default=SERVER_HOST,
+        help=f"Host del servidor (por defecto: {SERVER_HOST})",
+    )
+    parser.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=SERVER_PORT,
+        help=f"Puerto del servidor (por defecto: {SERVER_PORT})",
+    )
+    parser.add_argument(
+        "--particiones",
+        "-n",
+        type=int,
+        default=NUM_WORKERS,
+        help=f"Número de particiones/datos (por defecto: {NUM_WORKERS})",
+    )
+
+    
+    args = parser.parse_args()
+    SERVER_HOST = args.host
+    SERVER_PORT = args.port
+    NUM_WORKERS = args.particiones
+
+    # Definir TRANSFORM localmente
+    TRANSFORM = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
+    ])
+
+    # Crear dataset y dataloader
+    TRAINSET = datasets.CIFAR10(root='./data', train=True, download=True, transform=TRANSFORM)
+    TRAINLOADER = torch.utils.data.DataLoader(TRAINSET, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), persistent_workers=(NUM_WORKERS > 0))
+
     start_worker()
