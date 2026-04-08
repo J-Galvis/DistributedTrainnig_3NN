@@ -5,7 +5,7 @@ Utilities to load and compare neural-network training result JSON files.
 
 Usage examples
 --------------
-    from nn_training_analysis import load_training_folder, load_from_paths, compare_runs
+    from nn_training_analysis import load_training_folder, load_from_paths, compare_runs, compare_speedups
 
     # Option A – load every JSON in a folder
     runs = load_training_folder("./results")
@@ -17,7 +17,7 @@ Usage examples
         "/data/experiments/run_42.json",
     )
 
-    # Compare all loaded runs
+    # STANDARD COMPARISON: Compare all loaded runs
     compare_runs(runs)
 
     # Compare a named subset
@@ -25,6 +25,18 @@ Usage examples
 
     # Save the comparison to an HTML file
     compare_runs(runs, save_html="comparison.html")
+
+    # SPEEDUP COMPARISON: Compare implementations relative to a baseline
+    # Speedup = baseline_time / implementation_time
+    compare_speedups(runs, base_case="1worker", save_html="speedup_comparison.html")
+
+    # Compare a subset with baseline
+    compare_speedups(
+        runs, 
+        base_case="1worker",
+        keys=["1worker", "2workers", "4workers"],
+        save_html="speedup_subset.html"
+    )
 """
 
 import json
@@ -361,6 +373,302 @@ def compare_runs(
         .properties(
             title=alt.TitleParams(
                 text=f"Training Comparison — {len(selected)} model(s)",
+                fontSize=18,
+            )
+        )
+    )
+
+    if save_html:
+        combined.save(save_html)
+        print(f"Chart saved → {save_html}")
+
+    return combined
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. SPEEDUP COMPARISON MODULE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _normalize_base_case(base_case: str, runs: dict[str, dict]) -> str:
+    """
+    Normalize base_case to a model name. Handles both model names and file paths.
+    
+    If base_case is a model name already in runs, return it.
+    If base_case is a file path, extract the stem and try to find it in runs.
+    
+    Parameters
+    ----------
+    base_case : str
+        Either a model name or a file path.
+    runs : dict[str, dict]
+        Dictionary of loaded runs.
+    
+    Returns
+    -------
+    str
+        The model name to use as baseline.
+    
+    Raises
+    ------
+    KeyError
+        If the base_case (or its extracted stem) is not found in runs.
+    """
+    # First check if it's already a valid model name
+    if base_case in runs:
+        return base_case
+    
+    # Try extracting the stem from a potential file path
+    extracted = Path(base_case).stem
+    if extracted in runs:
+        print(f"[INFO] Resolved base_case '{base_case}' → model '{extracted}'")
+        return extracted
+    
+    # Not found in either format
+    raise KeyError(
+        f"Base case '{base_case}' not found. "
+        f"Available models: {list(runs.keys())}"
+    )
+
+
+def speedups_to_dataframe(
+    runs: dict[str, dict],
+    base_case: str,
+) -> pd.DataFrame:
+    """
+    Calculate speedup values relative to a baseline implementation.
+
+    Parameters
+    ----------
+    runs : dict[str, dict]
+        Output of :func:`load_training_folder` or :func:`load_from_paths`.
+    base_case : str
+        Name of the baseline model to compare against. Can be a model name or file path.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns: model, epoch, speedup, time_s_baseline, time_s_impl
+    """
+    # Normalize base_case to handle both model names and file paths
+    base_case = _normalize_base_case(base_case, runs)
+
+    def safe_list(x):
+        return x if isinstance(x, list) else []
+
+    # Extract baseline data
+    baseline_data = runs[base_case]
+    baseline_info = baseline_data.get("info_extra", {})
+    baseline_time = safe_list(baseline_info.get("historial_intervalo_times"))
+    baseline_epoch = safe_list(baseline_info.get("historial_intervalo_epochs"))
+
+    if not baseline_time or not baseline_epoch:
+        raise ValueError(f"Base case '{base_case}' has no training time data")
+
+    frames = []
+
+    for name, data in runs.items():
+        if name == base_case:
+            # Baseline gets speedup = 1.0
+            speedup_values = [1.0] * len(baseline_time)
+            frames.append(pd.DataFrame({
+                "model"           : [name] * len(baseline_time),
+                "epoch"           : baseline_epoch[:len(baseline_time)],
+                "speedup"         : speedup_values,
+                "time_s_baseline" : baseline_time[:len(baseline_time)],
+                "time_s_impl"     : baseline_time[:len(baseline_time)],
+            }))
+        else:
+            # Other models: calculate speedup
+            info = data.get("info_extra", {})
+            impl_time = safe_list(info.get("historial_intervalo_times"))
+            impl_epoch = safe_list(info.get("historial_intervalo_epochs"))
+
+            if not impl_time or not impl_epoch:
+                print(f"[WARNING] Skipping '{name}' (no timing data)")
+                continue
+
+            # Align on common epoch count
+            min_len = min(len(baseline_time), len(impl_time))
+            if min_len == 0:
+                print(f"[WARNING] Skipping '{name}' (no common epochs)")
+                continue
+
+            # Calculate speedup: speedup = baseline_time / impl_time
+            speedup_vals = [
+                baseline_time[i] / impl_time[i] if impl_time[i] > 0 else 1.0
+                for i in range(min_len)
+            ]
+
+            frames.append(pd.DataFrame({
+                "model"           : [name] * min_len,
+                "epoch"           : baseline_epoch[:min_len],
+                "speedup"         : speedup_vals,
+                "time_s_baseline" : baseline_time[:min_len],
+                "time_s_impl"     : impl_time[:min_len],
+            }))
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    print(f"[DEBUG] Speedup dataframe shape: {df.shape}")
+    return df
+
+
+def compare_speedups(
+    runs: dict[str, dict],
+    base_case: str,
+    keys: Optional[list[str]] = None,
+    save_html: Optional[str] = None,
+) -> alt.VConcatChart:
+    """
+    Create a speedup comparison visualization relative to a baseline implementation.
+
+    Speedup is calculated as: speedup = time_baseline / time_implementation
+
+    Parameters
+    ----------
+    runs : dict[str, dict]
+        Output of :func:`load_training_folder` or :func:`load_from_paths`.
+    base_case : str
+        Name of the baseline model to use as reference (speedup = 1.0).
+        Can be a model name (e.g., "oneWorker") or a file path 
+        (e.g., "../stats/CIFAR_10/oneWorker.json").
+    keys : list[str] | None
+        Names of the runs to include. ``None`` → all runs.
+    save_html : str | None
+        Optional file path to export the chart as a standalone HTML file.
+
+    Returns
+    -------
+    alt.VConcatChart
+        Ready to display in a Jupyter notebook or save programmatically.
+
+    Raises
+    ------
+    KeyError
+        If base_case is not in runs or if any key in keys is not found.
+    ValueError
+        If base_case has no training time data.
+    """
+    # Normalize base_case to handle both model names and file paths
+    base_case = _normalize_base_case(base_case, runs)
+
+    # ── select subset ────────────────────────────────────────────────────────
+    if keys:
+        missing = [k for k in keys if k not in runs]
+        if missing:
+            raise KeyError(f"Keys not found in runs: {missing}")
+        selected = {k: runs[k] for k in keys}
+    else:
+        selected = runs
+
+    if not selected:
+        raise ValueError("Need at least one run to compare.")
+
+    if base_case not in selected:
+        raise KeyError(f"Base case '{base_case}' not in selected runs")
+
+    # ── build speedup dataframe ──────────────────────────────────────────────
+    df = speedups_to_dataframe(selected, base_case)
+
+    if df.empty:
+        raise ValueError("No valid data to create speedup comparison")
+
+    # ── shared colour encoding ───────────────────────────────────────────────
+    colour = alt.Color(
+        "model:N",
+        legend=alt.Legend(title="Model", orient="right"),
+        scale=alt.Scale(scheme="category10"),
+    )
+
+    # ── tooltip definitions ──────────────────────────────────────────────────
+    tt_speedup = [
+        alt.Tooltip("model:N",     title="Model"),
+        alt.Tooltip("epoch:Q",     title="Epoch"),
+        alt.Tooltip("speedup:Q",   title="Speedup",          format=".2f"),
+        alt.Tooltip("time_s_impl:Q", title="Implementation Time (s)", format=".2f"),
+    ]
+
+    # Selection for pan/zoom
+    zoom_speedup = alt.selection_interval(bind="scales", name="zoom_speedup_epoch")
+
+    # ── Chart A – Speedup vs Epochs (full width) ─────────────────────────────
+    chart_speedup = (
+        alt.Chart(df)
+        .mark_line(point=alt.OverlayMarkDef(size=20, opacity=0.5))
+        .encode(
+            x=alt.X("epoch:Q",   title="Epoch",     scale=alt.Scale(nice=False, zero=False)),
+            y=alt.Y("speedup:Q", title="Speedup",   scale=alt.Scale(zero=False)),
+            color=colour,
+            tooltip=tt_speedup,
+        )
+        .properties(
+            title=alt.TitleParams("Speedup vs Epochs", fontSize=14),
+            width=_W_MAIN,
+            height=_H_MAIN,
+        )
+        .add_params(zoom_speedup)
+    )
+
+    # ── Chart B – Average Speedup per Model (bar chart, small left)  ─────────
+    avg_speedup = df.groupby("model")["speedup"].mean().reset_index()
+    avg_speedup.columns = ["model", "avg_speedup"]
+
+    chart_avg_speedup = (
+        alt.Chart(avg_speedup)
+        .mark_bar()
+        .encode(
+            x=alt.X("model:N", title="Model"),
+            y=alt.Y("avg_speedup:Q", title="Average Speedup", scale=alt.Scale(zero=True)),
+            color=alt.Color("model:N", scale=alt.Scale(scheme="category10"), legend=None),
+            tooltip=[
+                alt.Tooltip("model:N",        title="Model"),
+                alt.Tooltip("avg_speedup:Q", title="Avg Speedup", format=".2f"),
+            ],
+        )
+        .properties(
+            title=alt.TitleParams("Average Speedup per Model", fontSize=14),
+            width=_W_SMALL,
+            height=_H_SMALL,
+        )
+    )
+
+    # ── Chart C – Time Reduction Percentage (small right) ───────────────────
+    # Time reduction = (1 - impl_time / baseline_time) * 100 = (speedup - 1) / speedup * 100
+    df["time_reduction_pct"] = ((df["speedup"] - 1) / df["speedup"]) * 100
+
+    chart_time_reduction = (
+        alt.Chart(df)
+        .mark_line(point=alt.OverlayMarkDef(size=16, opacity=0.5))
+        .encode(
+            x=alt.X("epoch:Q",               title="Epoch", scale=alt.Scale(nice=False, zero=False)),
+            y=alt.Y("time_reduction_pct:Q", title="Time Reduction (%)", scale=alt.Scale(zero=False)),
+            color=colour,
+            tooltip=[
+                alt.Tooltip("model:N",             title="Model"),
+                alt.Tooltip("epoch:Q",             title="Epoch"),
+                alt.Tooltip("time_reduction_pct:Q", title="Time Reduction (%)", format=".1f"),
+            ],
+        )
+        .properties(
+            title=alt.TitleParams("Time Reduction %", fontSize=14),
+            width=_W_SMALL,
+            height=_H_SMALL,
+        )
+    )
+
+    # ── Compose layout ───────────────────────────────────────────────────────
+    #   Row 1 → Chart A  (full width)
+    #   Row 2 → Chart B | Chart C  (side by side)
+    bottom_row = (
+        alt.hconcat(chart_avg_speedup, chart_time_reduction)
+        .resolve_scale(color="shared", y="independent")
+    )
+
+    combined = (
+        alt.vconcat(chart_speedup, bottom_row)
+        .resolve_scale(color="shared")
+        .properties(
+            title=alt.TitleParams(
+                text=f"Speedup Comparison (baseline: '{base_case}') — {len(selected)} model(s)",
                 fontSize=18,
             )
         )
