@@ -32,25 +32,30 @@ def guardar_modelo(W1, b1, W2, b2, nombre_modelo, precision_test=None,
     ruta_archivo_pkl = os.path.join(CARPETA_MODELOS, nombre_archivo_pkl)
     ruta_archivo_json = os.path.join(CARPETA_STATS, nombre_archivo_json)
 
+    if not (W1 is None or b1 is None or W2 is None or b2 is None):
     # Empaquetar solo los pesos en el pickle
-    datos_modelo = {
-        'W1': W1,
-        'b1': b1,
-        'W2': W2,
-        'b2': b2
-    }
+        datos_modelo = {
+            'W1': W1,
+            'b1': b1,
+            'W2': W2,
+            'b2': b2
+        }
 
-    # Guardar pesos con pickle
-    with open(ruta_archivo_pkl, 'wb') as archivo:
-        pickle.dump(datos_modelo, archivo)
+        # Guardar pesos con pickle
+        with open(ruta_archivo_pkl, 'wb') as archivo:
+            pickle.dump(datos_modelo, archivo)
+        
+                # Arquitectura
+        entrada = int(W1.shape[0])
+        oculta = int(W1.shape[1])
+        salida = int(W2.shape[1])
+    
+    else:
+        entrada = oculta = salida = None
 
     # Construir metadatos
     fecha_guardado = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    # Arquitectura
-    entrada = int(W1.shape[0])
-    oculta = int(W1.shape[1])
-    salida = int(W2.shape[1])
+
     
     # Metadatos básicos
     metadatos = {
@@ -64,7 +69,7 @@ def guardar_modelo(W1, b1, W2, b2, nombre_modelo, precision_test=None,
             'entrada': entrada,
             'oculta': oculta,
             'salida': salida,
-        }
+        }   
     }
     
     # Agregar información extra

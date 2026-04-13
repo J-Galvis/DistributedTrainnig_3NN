@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from defineNetwork import Net
 from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
 from messageHandling import send_message, receive_message
+from Utils.ModelPersistence import guardar_modelo
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN DEL SERVIDOR
@@ -337,6 +338,7 @@ class DistributedTrainingServer:
         print(f"{'='*70}\n")
         
         training_start = time.time()
+        final_test_acc = 0.0
         
         try:
             for epoch in range(1, self.epocas + 1):
@@ -361,6 +363,7 @@ class DistributedTrainingServer:
                 # Evaluar en test (cada INTERVALO_LOG épocas)
                 if epoch % INTERVALO_LOG == 0 or epoch == 1:
                     test_acc = accuracyTest(self.net, TRANSFORM, 0)
+                    final_test_acc = test_acc
                 else:
                     test_acc = 0.0
                 
@@ -374,8 +377,40 @@ class DistributedTrainingServer:
             print(f"  ENTRENAMIENTO COMPLETADO")
             print(f"{'='*70}\n")
             
-            # Guardar modelo y metadatos
-            self.save_model_with_metadata(training_start)
+            # Calcular tiempo total de entrenamiento
+            tiempo_total = time.time() - training_start
+            
+            # Evaluar modelo final en test
+            final_test_acc = accuracyTest(self.net, TRANSFORM, 0)
+
+            nombre_modelo = input("\n  Ingrese un nombre para guardar el modelo: ").strip()
+            
+            # Guardar modelo PyTorch
+            model_path = f"models/{nombre_modelo}_cifar10.pt"
+            os.makedirs("models", exist_ok=True)
+            torch.save(self.net.state_dict(), model_path)
+            
+            # Guardar modelo con métricas completas
+            guardar_modelo(
+                None, None, None, None,  # PyTorch model, not NumPy weights
+                nombre_modelo=nombre_modelo,
+                precision_test=final_test_acc,
+                epocas=self.epocas,
+                learning_rate=self.learning_rate,
+                training_time=tiempo_total,
+                info_extra={
+                    'num_workers': self.num_workers,
+                    'architecture': 'CIFAR10 CNN - Distributed with Sockets',
+                    'server_host': self.host,
+                    'server_port': self.port,
+                    'tiempo_total_segundos': tiempo_total,
+                    'historial_intervalo_epochs': self.historial_intervalo_epochs,
+                    'historial_intervalo_times': self.historial_intervalo_times,
+                    'historial_intervalo_acc_test': self.historial_intervalo_acc_test,
+                    'historial_intervalo_loss': self.historial_intervalo_loss,
+                    'model_path': model_path,
+                }
+            )
         
         except Exception as e:
             print(f"\n✗ Error durante entrenamiento: {e}")
@@ -389,52 +424,6 @@ class DistributedTrainingServer:
                     pass
             self.server_socket.close()
     
-    def save_model_with_metadata(self, training_start):
-        """
-        Guarda el modelo y sus metadatos en formato JSON.
-        """
-        # Crear directorio para stats si no existe
-        stats_dir = './stats'
-        os.makedirs(stats_dir, exist_ok=True)
-        
-        # Calcular tiempo total
-        total_time = time.time() - training_start
-        
-        # Solicitar nombre del modelo
-        model_name = input("\n  Ingrese un nombre para guardar el modelo: ").strip()
-        if not model_name:
-            model_name = f"cifar10_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        # Guardar pesos del modelo
-        model_path = os.path.join('./modelos_guardados', f"{model_name}.pth")
-        os.makedirs('./modelos_guardados', exist_ok=True)
-        torch.save(self.net.state_dict(), model_path)
-        print(f"\n  ✓ Modelo guardado en: {model_path}")
-        
-        # Preparar metadatos
-        metadata = {
-            'nombre_modelo': model_name,
-            'fecha_guardado': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'arquitectura': 'Distributed CNN with Sockets',
-            'epocas': self.epocas,
-            'learning_rate': self.learning_rate,
-            'num_workers': self.num_workers,
-            'training_time_seconds': round(total_time, 2),
-            'server_host': self.host,
-            'server_port': self.port,
-            'batch_size': BATCH_SIZE,
-            'historial_intervalo_epochs': self.historial_intervalo_epochs,
-            'historial_intervalo_times': self.historial_intervalo_times,
-            'historial_intervalo_acc_test': self.historial_intervalo_acc_test,
-            'historial_intervalo_loss': self.historial_intervalo_loss,
-        }
-        
-        # Guardar metadatos en JSON
-        metadata_path = os.path.join(stats_dir, f"{model_name}_metadata.json")
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
-        
-        print(f"  ✓ Metadatos guardados en: {metadata_path}")
 
 def start_server():
     """Inicia el servidor de entrenamiento distribuido"""

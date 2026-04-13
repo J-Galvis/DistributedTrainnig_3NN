@@ -90,6 +90,6 @@ class TrainingConfig:
     intervalo_log: int = 10
     server_host: str = 'localhost'
     server_port: int = 6000
-    socket_timeout: int = 300  # segundos
+    socket_timeout: int = 500 # segundos
     batch_size: int = 32
     save_file: str = './Results/cifar10_trained_model.pth'
