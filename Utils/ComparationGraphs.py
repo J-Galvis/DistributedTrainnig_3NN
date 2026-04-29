@@ -227,8 +227,6 @@ def runs_metadata(runs: dict[str, dict]) -> pd.DataFrame:
 # Chart size constants – tweak these to taste
 _W_MAIN  = 1000   # full-width chart
 _H_MAIN  = 500
-_W_SMALL =  490   # two small charts sit side-by-side inside the same 1000 px
-_H_SMALL =  380
 
 
 def compare_runs(
@@ -324,16 +322,16 @@ def compare_runs(
         )
         .properties(
             title=alt.TitleParams("Training Accuracy vs Epochs", fontSize=14),
-            width=_W_SMALL,
-            height=_H_SMALL,
+            width=_W_MAIN,
+            height=_H_MAIN,
         )
         .add_params(zoom_a)
     )
 
     # ── Chart C – Loss vs Epochs  (small, right) ─────────────────────────────
     
-    if loose:
-        chart_loss_epoch = (
+
+    chart_loss_epoch = (
         alt.Chart(df)
         .mark_line(point=alt.OverlayMarkDef(size=20, opacity=0.5))
         .encode(
@@ -344,31 +342,15 @@ def compare_runs(
         )
         .properties(
             title=alt.TitleParams("Loss vs Epochs", fontSize=14),
-            width=_W_SMALL,
-            height=_H_SMALL,
+            width=_W_MAIN,
+            height=_H_MAIN,
         )
         .add_params(zoom_c)
         )
 
-   
-
-    # ── Compose layout ────────────────────────────────────────────────────────
-    #   Row 1 → Chart A  (full width)
-    #   Row 2 → Chart B | Chart C  (side by side, independent Y axes)
-    if loose:
-        bottom_row = (
-            alt.hconcat(chart_acc_epoch, chart_loss_epoch)
-            .resolve_scale(color="shared", y="independent")
-        )
-    
-    else:
-        bottom_row = (
-            alt.hconcat(chart_acc_epoch)
-            .resolve_scale(color="shared", y="independent")
-        )
 
     combined = (
-        alt.vconcat(chart_epoch_time , bottom_row)
+        alt.vconcat(chart_epoch_time , chart_acc_epoch, chart_loss_epoch)
         .resolve_scale(color="shared")
         .properties(
             title=alt.TitleParams(
@@ -608,29 +590,6 @@ def compare_speedups(
         .add_params(zoom_speedup)
     )
 
-    # ── Chart B – Average Speedup per Model (bar chart, small left)  ─────────
-    avg_speedup = df.groupby("model")["speedup"].mean().reset_index()
-    avg_speedup.columns = ["model", "avg_speedup"]
-
-    chart_avg_speedup = (
-        alt.Chart(avg_speedup)
-        .mark_bar()
-        .encode(
-            x=alt.X("model:N", title="Model"),
-            y=alt.Y("avg_speedup:Q", title="Average Speedup", scale=alt.Scale(zero=True)),
-            color=alt.Color("model:N", scale=alt.Scale(scheme="category10"), legend=None),
-            tooltip=[
-                alt.Tooltip("model:N",        title="Model"),
-                alt.Tooltip("avg_speedup:Q", title="Avg Speedup", format=".2f"),
-            ],
-        )
-        .properties(
-            title=alt.TitleParams("Average Speedup per Model", fontSize=14),
-            width=_W_SMALL,
-            height=_H_SMALL,
-        )
-    )
-
     # ── Chart C – Time Reduction Percentage (small right) ───────────────────
     # Time reduction = (1 - impl_time / baseline_time) * 100 = (speedup - 1) / speedup * 100
     df["time_reduction_pct"] = ((df["speedup"] - 1) / df["speedup"]) * 100
@@ -650,21 +609,13 @@ def compare_speedups(
         )
         .properties(
             title=alt.TitleParams("Time Reduction %", fontSize=14),
-            width=_W_SMALL,
-            height=_H_SMALL,
+            width=_W_MAIN,
+            height=_H_MAIN,
         )
     )
 
-    # ── Compose layout ───────────────────────────────────────────────────────
-    #   Row 1 → Chart A  (full width)
-    #   Row 2 → Chart B | Chart C  (side by side)
-    bottom_row = (
-        alt.hconcat(chart_avg_speedup, chart_time_reduction)
-        .resolve_scale(color="shared", y="independent")
-    )
-
     combined = (
-        alt.vconcat(chart_speedup, bottom_row)
+        alt.vconcat(chart_speedup, chart_time_reduction)
         .resolve_scale(color="shared")
         .properties(
             title=alt.TitleParams(
