@@ -1,17 +1,18 @@
 """
 =============================================================================
-  SERVIDOR — ENTRENAMIENTO NEURONAL DISTRIBUIDO CON SOCKETS
+  SERVIDOR — ENTRENAMIENTO NEURONAL DISTRIBUIDO IMAGENET CON SOCKETS
 =============================================================================
 
 El servidor:
-1. Carga y particiona el dataset CIFAR10 en K particiones
-2. Abre un socket servidor esperando conexiones de workers
-3. Para cada época:
-   - Envía a cada worker: epoch, batch_ids, pesos globales, learning_rate, init/stop signal
+1. Carga el dataset ImageNet en modo streaming (HuggingFace)
+2. Particiona el dataset en K shards (uno por worker)
+3. Abre un socket servidor esperando conexiones de workers
+4. Para cada época:
+   - Envía a cada worker: epoch, batch_ids, shard_size, pesos globales, learning_rate, init/stop signal
    - Recibe de cada worker: gradientes calculados
    - Promedia los gradientes
    - Actualiza los pesos globales
-4. Al final, evaluación en test
+5. Al final, evaluación en validación
 =============================================================================
 """
 
@@ -20,8 +21,6 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 import socket
 import time
 import json
@@ -33,8 +32,13 @@ import argparse
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from defineNetwork import Net
-from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
+from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig, SHARD_SIZE
 from messageHandling import send_message, receive_message
+from Utils.loadImageNet import (
+    get_imagenet_stream_dataloader, 
+    get_hf_split_size,
+    detect_data_source
+)
 from Utils.ModelPersistence import guardar_modelo
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,51 +55,49 @@ SERVER_PORT = TrainingConfig.server_port
 BATCH_SIZE = TrainingConfig.batch_size
 SAVE_FILE = TrainingConfig.save_file
 NUM_EPOCHS = TrainingConfig.epocas
-
-def testingNetwork(testloader, net):
-    """Evalúa el modelo en el dataset de prueba"""
-    correct = 0
-    total = 0
-    net.eval()
-    with torch.no_grad():
-        for data in testloader:
-            images, labels = data
-            outputs = net(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    return (100 * correct / total)
-
-def accuracyTest(net, transform, num_workers):
-    """Carga el dataset de prueba y evalúa"""
-    print("Starting testing...")
-    testset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=32, shuffle=False, num_workers=num_workers)
-    return testingNetwork(testloader, net)
+NUM_CLASSES = TrainingConfig.num_classes
+IMAGENET_SPLIT = TrainingConfig.imagenet_split
+HF_TOKEN = TrainingConfig.hf_token
 
 class DistributedTrainingServer:
     """
-    Servidor de Entrenamiento Distribuido CIFAR10.
+    Servidor de Entrenamiento Distribuido ImageNet.
     
-    Maneja conexiones de múltiples workers y coordina el entrenamiento federado.
+    Maneja conexiones de múltiples workers y coordina el entrenamiento federado
+    con shards de ImageNet.
     """
     
-    def __init__(self, host, port, num_workers, epocas, learning_rate):
+    def __init__(self, host, port, num_workers, epocas, learning_rate, hf_token, split='train'):
         self.host = host
         self.port = port
         self.num_workers = num_workers
         self.epocas = epocas
         self.learning_rate = learning_rate
+        self.hf_token = hf_token
+        self.split = split
         
         # Modelo
-        self.net = Net()
-        self.optimizer = optim.AdamW(self.net.parameters(), lr=learning_rate, weight_decay=1e-2,
-                                     betas=(0.9, 0.999), eps=1e-8)
+        self.net = Net(num_classes=NUM_CLASSES)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.net.to(self.device)
+        
+        self.optimizer = optim.AdamW(
+            self.net.parameters(), 
+            lr=learning_rate, 
+            weight_decay=1e-2,
+            betas=(0.9, 0.999), 
+            eps=1e-8
+        )
+        
+        # Dataset size for scheduler
+        self.total_dataset_size = get_hf_split_size(split)
+        batches_per_epoch = self.total_dataset_size // (BATCH_SIZE * num_workers)
+        
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=0.01,
             epochs=epocas,
-            steps_per_epoch=len(TRAINLOADER),
+            steps_per_epoch=batches_per_epoch,
             pct_start=0.3,
             div_factor=10,
             final_div_factor=100
@@ -105,14 +107,41 @@ class DistributedTrainingServer:
         self.worker_sockets: Dict[int, socket.socket] = {}
         self.worker_connected = {}
         
-        # Datos
-        self.total_batches = len(TRAINLOADER)
+        # Datos sobre particiones
+        self.shard_sizes = self._calculate_shard_sizes()
         
-        # Historial de checkpoints por INTERVALO_LOG
-        self.historial_intervalo_epochs = []      # Épocas en las que se guardó
-        self.historial_intervalo_times = []       # Tiempos acumulados
-        self.historial_intervalo_acc_test = []    # Precisión en test
-        self.historial_intervalo_loss = []        # Loss promedio
+        # Historial de checkpoints
+        self.historial_intervalo_epochs = []
+        self.historial_intervalo_times = []
+        self.historial_intervalo_loss = []
+    
+    def _calculate_shard_sizes(self) -> Dict[int, int]:
+        """
+        Calcula el tamaño de shard para cada worker.
+        
+        ImageNet train tiene 1,281,167 imágenes.
+        Se distribuyen equitativamente entre workers.
+        
+        Retorna:
+            Dict[worker_id] = tamaño_shard
+        """
+        total_size = self.total_dataset_size
+        shard_sizes = {}
+        
+        size_per_worker = total_size // self.num_workers
+        remaining = total_size % self.num_workers
+        
+        for worker_id in range(self.num_workers):
+            # Los primeros 'remaining' workers reciben un elemento extra
+            shard_sizes[worker_id] = size_per_worker + (1 if worker_id < remaining else 0)
+        
+        print(f"\n  Distribución de shards:")
+        print(f"  Total dataset size: {total_size:,} imágenes")
+        print(f"  Shards por worker:")
+        for w_id, size in shard_sizes.items():
+            print(f"    Worker {w_id}: {size:,} imágenes (~{size // BATCH_SIZE} batches @ batch_size={BATCH_SIZE})")
+        
+        return shard_sizes
     
     def setup_socket_server(self):
         """Configura el socket servidor."""
@@ -123,7 +152,7 @@ class DistributedTrainingServer:
         self.server_socket.settimeout(SOCKET_TIMEOUT)
         
         print(f"\n{'='*70}")
-        print(f"  SERVIDOR DISTRIBUIDO — ESCUCHANDO EN {self.host}:{self.port}")
+        print(f"  SERVIDOR DISTRIBUIDO IMAGENET — ESCUCHANDO EN {self.host}:{self.port}")
         print(f"{'='*70}")
         print(f"  Esperando {self.num_workers} conexiones de workers...")
     
@@ -131,7 +160,7 @@ class DistributedTrainingServer:
         """
         Espera a que se conecten todos los workers.
         Asigna worker_id basado en el orden de conexión.
-        Envía mensaje de sincronización inicial a cada worker.
+        Envía mensaje de sincronización inicial a cada worker con shard_size.
         """
         # FASE 1: Aceptar todas las conexiones
         for worker_id in range(self.num_workers):
@@ -161,12 +190,15 @@ class DistributedTrainingServer:
             try:
                 # Crear mensaje de sincronización (epoch=0, init_signal=True)
                 params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
+                shard_size = self.shard_sizes[worker_id]
+                
                 message = MessageFromServer(
                     batch_ids=[],
                     epoch=0,
                     init_signal=True,
                     stop_signal=False,
                     learning_rate=self.learning_rate,
+                    shard_size=shard_size,
                     params=params
                 )
                 
@@ -174,7 +206,7 @@ class DistributedTrainingServer:
                 sock = self.worker_sockets[worker_id]
                 send_message(sock, message)
                 
-                print(f"    → Sincronización enviada a worker {worker_id}")
+                print(f"    → Sincronización enviada a worker {worker_id} (shard_size={shard_size:,})")
                 
             except Exception as e:
                 print(f"    ✗ Error sincronizando worker {worker_id}: {e}")
@@ -190,7 +222,7 @@ class DistributedTrainingServer:
                 sock = self.worker_sockets[worker_id]
                 ready_msg = receive_message(sock)
                 
-                print(f"    ✓ Worker {worker_id} listo (dataset_size={ready_msg.dataset_size})")
+                print(f"    ✓ Worker {worker_id} listo (dataset_size={ready_msg.dataset_size:,})")
                 
             except Exception as e:
                 print(f"    ✗ Error esperando confirmación de worker {worker_id}: {e}")
@@ -202,22 +234,18 @@ class DistributedTrainingServer:
         """
         Distribuye trabajo a todos los workers para una época.
         
-        Envía a cada worker: epoch, batch_ids, pesos globales, learning_rate, etc.
+        Envía a cada worker: epoch, batch_ids, shard_size, pesos globales, learning_rate, etc.
         """
         print(f"\n  {'─'*68}")
         print(f"  ÉPOCA {epoch}/{self.epocas} — DISTRIBUYENDO TRABAJO A WORKERS")
         print(f"  {'─'*68}")
         
-        # Calcular distribución de batches entre workers
-        batches_per_worker = self.total_batches // self.num_workers
-        remaining_batches = self.total_batches % self.num_workers
-        
         for worker_id in range(self.num_workers):
             try:
-                # Calcular batches para este worker
-                batch_count = batches_per_worker + (1 if worker_id < remaining_batches else 0)
-                batch_start = worker_id * batches_per_worker + min(worker_id, remaining_batches)
-                batch_ids = list(range(batch_start, batch_start + batch_count))
+                # Calcular número de batches según shard_size
+                shard_size = self.shard_sizes[worker_id]
+                num_batches = shard_size // BATCH_SIZE
+                batch_ids = list(range(num_batches))
                 
                 # Obtener parámetros actuales del modelo
                 params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
@@ -229,6 +257,7 @@ class DistributedTrainingServer:
                     init_signal=(epoch == 1),
                     stop_signal=(epoch == self.epocas),
                     learning_rate=self.learning_rate,
+                    shard_size=shard_size,
                     params=params
                 )
                 
@@ -236,7 +265,8 @@ class DistributedTrainingServer:
                 sock = self.worker_sockets[worker_id]
                 send_message(sock, message)
                 
-                print(f"    ✓ Enviado a worker {worker_id}: epoch={epoch}, batches={len(batch_ids)}")
+                print(f"    ✓ Enviado a worker {worker_id}: epoch={epoch}, "
+                      f"shard_size={shard_size:,}, batches={len(batch_ids)}")
                 
             except Exception as e:
                 print(f"    ✗ Error enviando a worker {worker_id}: {e}")
@@ -307,26 +337,24 @@ class DistributedTrainingServer:
         self.optimizer.step()
         self.scheduler.step()
     
-    def evaluate_global_model(self, epoch, tiempo_actual, test_acc, avg_loss):
+    def evaluate_global_model(self, epoch, tiempo_actual, avg_loss):
         """
         Evalúa el modelo global y guarda métricas en historial.
         
         Parámetros:
             epoch: int, número de época actual
             tiempo_actual: float, tiempo transcurrido desde el inicio del entrenamiento
-            test_acc: float, precisión en test
             avg_loss: float, pérdida promedio de la época
         """
         if epoch % INTERVALO_LOG == 0 or epoch == 1:
             self.historial_intervalo_epochs.append(epoch)
             self.historial_intervalo_times.append(round(tiempo_actual, 6))
-            self.historial_intervalo_acc_test.append(round(test_acc, 2))
             self.historial_intervalo_loss.append(round(avg_loss, 6))
             
             print(f"\n  {'─'*68}")
             print(f"  EVALUACIÓN GLOBAL — ÉPOCA {epoch}/{self.epocas}")
             print(f"  {'─'*68}")
-            print(f"    ✓ GLOBAL → Loss: {avg_loss:.4f} │ Acc Test: {test_acc:.1f}%")
+            print(f"    ✓ GLOBAL → Loss: {avg_loss:.4f}")
             print(f"    ⏱ Tiempo acumulado: {tiempo_actual:.2f}s")
     
     def training_loop(self):
@@ -334,11 +362,10 @@ class DistributedTrainingServer:
         Bucle principal de entrenamiento.
         """
         print(f"\n{'='*70}")
-        print(f"  INICIANDO ENTRENAMIENTO DISTRIBUIDO")
+        print(f"  INICIANDO ENTRENAMIENTO DISTRIBUIDO IMAGENET")
         print(f"{'='*70}\n")
         
         training_start = time.time()
-        final_test_acc = 0.0
         
         try:
             for epoch in range(1, self.epocas + 1):
@@ -353,6 +380,7 @@ class DistributedTrainingServer:
                 # Promediar gradientes y calcular pérdida promedio
                 avg_grads = self.average_gradients(messages)
                 avg_loss = sum(msg.loss for msg in messages) / len(messages) if messages else 0.0
+                avg_acc = sum(msg.accuracy for msg in messages) / len(messages) if messages else 0.0
                 
                 # Actualizar modelo
                 self.update_model(avg_grads)
@@ -360,18 +388,11 @@ class DistributedTrainingServer:
                 epoch_time = time.time() - epoch_start
                 total_time = time.time() - training_start
                 
-                # Evaluar en test (cada INTERVALO_LOG épocas)
-                if epoch % INTERVALO_LOG == 0 or epoch == 1:
-                    test_acc = accuracyTest(self.net, TRANSFORM, 0)
-                    final_test_acc = test_acc
-                else:
-                    test_acc = 0.0
-                
                 # Registrar métricas en historial
-                self.evaluate_global_model(epoch, total_time, test_acc, avg_loss)
+                self.evaluate_global_model(epoch, total_time, avg_loss)
                 
-                if epoch % INTERVALO_LOG == 0 or epoch == 1:
-                    print(f"  Epoch {epoch} completada en {epoch_time:.4f}s (Total: {total_time:.4f}s)\n")
+                print(f"  Epoch {epoch} completada en {epoch_time:.4f}s "
+                      f"(Total: {total_time:.4f}s | Acc: {avg_acc:.2f}%)\n")
             
             print(f"\n{'='*70}")
             print(f"  ENTRENAMIENTO COMPLETADO")
@@ -379,14 +400,11 @@ class DistributedTrainingServer:
             
             # Calcular tiempo total de entrenamiento
             tiempo_total = time.time() - training_start
-            
-            # Evaluar modelo final en test
-            final_test_acc = accuracyTest(self.net, TRANSFORM, 0)
 
             nombre_modelo = input("\n  Ingrese un nombre para guardar el modelo: ").strip()
             
             # Guardar modelo PyTorch
-            model_path = f"models/{nombre_modelo}_cifar10.pt"
+            model_path = f"models/{nombre_modelo}_imagenet.pt"
             os.makedirs("models", exist_ok=True)
             torch.save(self.net.state_dict(), model_path)
             
@@ -394,21 +412,22 @@ class DistributedTrainingServer:
             guardar_modelo(
                 None, None, None, None,  # PyTorch model, not NumPy weights
                 nombre_modelo=nombre_modelo,
-                precision_test=final_test_acc,
+                precision_test=0.0,
                 epocas=self.epocas,
                 learning_rate=self.learning_rate,
                 training_time=tiempo_total,
                 info_extra={
                     'num_workers': self.num_workers,
-                    'architecture': 'CIFAR10 CNN - Distributed with Sockets',
+                    'architecture': 'ImageNet ResNet - Distributed with Sockets',
                     'server_host': self.host,
                     'server_port': self.port,
                     'tiempo_total_segundos': tiempo_total,
                     'historial_intervalo_epochs': self.historial_intervalo_epochs,
                     'historial_intervalo_times': self.historial_intervalo_times,
-                    'historial_intervalo_acc_test': self.historial_intervalo_acc_test,
                     'historial_intervalo_loss': self.historial_intervalo_loss,
                     'model_path': model_path,
+                    'dataset_split': self.split,
+                    'num_classes': NUM_CLASSES,
                 }
             )
         
@@ -425,17 +444,19 @@ class DistributedTrainingServer:
             self.server_socket.close()
     
 
-def start_server():
+def start_server(host, port, num_workers, epocas, learning_rate, hf_token, split):
     """Inicia el servidor de entrenamiento distribuido"""
-    server = DistributedTrainingServer(SERVER_HOST, SERVER_PORT, NUM_WORKERS, NUM_EPOCHS, LEARNING_RATE)
+    server = DistributedTrainingServer(
+        host, port, num_workers, epocas, learning_rate, hf_token, split
+    )
     server.setup_socket_server()
     server.wait_for_workers()
     server.training_loop()
 
+
 if __name__ == '__main__':
-        # permitir pasar parámetros por línea de comandos para el servidor
     parser = argparse.ArgumentParser(
-        description="Servidor para entrenamiento distribuido."
+        description="Servidor para entrenamiento distribuido de ImageNet."
     )
 
     parser.add_argument(
@@ -452,11 +473,11 @@ if __name__ == '__main__':
         help=f"Puerto en el que el servidor escuchará (por defecto: {SERVER_PORT})",
     )
     parser.add_argument(
-        "--particiones",
-        "-n",
+        "--workers",
+        "-w",
         type=int,
         default=NUM_WORKERS,
-        help=f"Número de particiones/datos (por defecto: {NUM_WORKERS})",
+        help=f"Número de workers (por defecto: {NUM_WORKERS})",
     )
     parser.add_argument(
         "--epocas",
@@ -473,30 +494,27 @@ if __name__ == '__main__':
         help=f"Tasa de aprendizaje (por defecto: {LEARNING_RATE})",
     )
     parser.add_argument(
-        "--intervalo-log",
-        type=int,
-        default=INTERVALO_LOG,
-        help=f"Intervalo de logging de métricas (por defecto: {INTERVALO_LOG})",
+        "--hf-token",
+        type=str,
+        default=HF_TOKEN,
+        help="Token de HuggingFace para acceso a ImageNet",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=IMAGENET_SPLIT,
+        choices=['train', 'val'],
+        help=f"Split de ImageNet a usar (por defecto: {IMAGENET_SPLIT})",
     )
 
-
     args = parser.parse_args()
-    SERVER_HOST = args.host
-    SERVER_PORT = args.port
-    NUM_WORKERS = args.particiones
-    NUM_EPOCHS = args.epocas
-    LEARNING_RATE = args.lr
-    INTERVALO_LOG = args.intervalo_log
 
-    # Definir TRANSFORM localmente
-    TRANSFORM = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-    ])
-
-    # Crear dataset y dataloader
-    TRAINSET = datasets.CIFAR10(root='./data', train=True, download=True, transform=TRANSFORM)
-    TRAINLOADER = torch.utils.data.DataLoader(TRAINSET, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available(), persistent_workers=(NUM_WORKERS > 0))
-
-
-    start_server()
+    start_server(
+        args.host,
+        args.port,
+        args.workers,
+        args.epocas,
+        args.lr,
+        args.hf_token,
+        args.split,
+    )

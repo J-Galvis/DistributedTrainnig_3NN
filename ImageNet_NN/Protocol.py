@@ -1,15 +1,17 @@
 """
-Protocolo de Comunicación para Entrenamiento Distribuido CIFAR10
-=================================================================
+Protocolo de Comunicación para Entrenamiento Distribuido ImageNet
+==================================================================
 
 Define la estructura de los mensajes intercambiados entre Server y Workers
-mediante sockets y pickle.
+mediante sockets y pickle para entrenamiento con ImageNet en modo shards.
 """
 
 from dataclasses import dataclass
 from typing import Dict
 import numpy as np
 
+# Constante para tamaño de shard de datos
+SHARD_SIZE = 50_000  # Imágenes por shard del dataset
 
 @dataclass
 class MessageFromServer:
@@ -22,6 +24,7 @@ class MessageFromServer:
         init_signal: bool - True al inicio del entrenamiento
         stop_signal: bool - True para detener el worker
         learning_rate: float - Tasa de aprendizaje
+        shard_size: int - Tamaño de la porción del dataset para este worker
         params: Dict - Parámetros del modelo (PyTorch state_dict)
     """
     batch_ids: list
@@ -29,11 +32,12 @@ class MessageFromServer:
     init_signal: bool
     stop_signal: bool
     learning_rate: float
+    shard_size: int
     params: Dict
     
     def __repr__(self):
         return (f"MessageFromServer(epoch={self.epoch}, batches={len(self.batch_ids)}, "
-                f"init={self.init_signal}, stop={self.stop_signal})")
+                f"shard_size={self.shard_size}, init={self.init_signal}, stop={self.stop_signal})")
 
 
 @dataclass
@@ -71,7 +75,7 @@ class WorkerReadyMessage:
     
     Atributos:
         worker_id: int - Identificador del worker
-        dataset_size: int - Tamaño de la partición asignada
+        dataset_size: int - Tamaño de la partición asignada (shard_size)
     """
     worker_id: int
     dataset_size: int
@@ -83,13 +87,16 @@ class WorkerReadyMessage:
 
 @dataclass
 class TrainingConfig:
-    """Configuración global de entrenamiento distribuido."""
+    """Configuración global de entrenamiento distribuido para ImageNet."""
     num_workers: int = 1
-    epocas: int = 60
+    epocas: int = 10
     learning_rate: float = 0.001
     intervalo_log: int = 1
     server_host: str = 'localhost'
     server_port: int = 6000
-    socket_timeout: int = 500 # segundos
+    socket_timeout: int = 500  # segundos
     batch_size: int = 32
-    save_file: str = './Results/cifar10_trained_model.pth'
+    num_classes: int = 1000  # ImageNet tiene 1000 clases
+    save_file: str = './Results/imagenet_trained_model.pth'
+    imagenet_split: str = 'train'  # 'train' o 'val'
+    hf_token: str = ''  # Token de HuggingFace para ImageNet
