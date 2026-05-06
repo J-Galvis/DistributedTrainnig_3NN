@@ -214,6 +214,7 @@ class DistributedTrainingServer:
         Distribuye trabajo a todos los workers para una época.
         
         Envía a cada worker: epoch, batch_ids, shard_size, pesos globales, learning_rate, etc.
+        Cada worker recibe diferentes batch_ids para trabajar en particiones distintas.
         """
         print(f"\n  {'─'*68}")
         print(f"  ÉPOCA {epoch}/{self.epocas} — DISTRIBUYENDO TRABAJO A WORKERS")
@@ -224,7 +225,13 @@ class DistributedTrainingServer:
                 # Calcular número de batches según shard_size
                 shard_size = self.shard_sizes
                 num_batches = shard_size // BATCH_SIZE
-                batch_ids = list(range(num_batches))
+                
+                # IMPORTANTE: Cada worker recibe diferentes batch_ids
+                # Worker 0: [0, 1, 2, ...], Worker 1: [K, K+1, K+2, ...], etc.
+                batches_per_worker = num_batches // self.num_workers
+                start_batch = worker_id * batches_per_worker
+                end_batch = start_batch + batches_per_worker if worker_id < self.num_workers - 1 else num_batches
+                batch_ids = list(range(start_batch, end_batch))
                 
                 # Obtener parámetros actuales del modelo
                 params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
@@ -245,7 +252,8 @@ class DistributedTrainingServer:
                 send_message(sock, message)
                 
                 print(f"    ✓ Enviado a worker {worker_id}: epoch={epoch}, "
-                      f"shard_size={shard_size:,}, batches={len(batch_ids)}")
+                      f"shard_size={shard_size:,}, batches={len(batch_ids)} "
+                      f"[{start_batch}-{end_batch-1}]")
                 
             except Exception as e:
                 print(f"    ✗ Error enviando a worker {worker_id}: {e}")
