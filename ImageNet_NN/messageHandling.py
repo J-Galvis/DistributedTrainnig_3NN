@@ -109,7 +109,7 @@ def send_message(sock, message, compression_threshold=1_000_000, compression_lev
         start_net = time.time()
         
         # Header: [metadata_len: 4B] [is_compressed: 1B] [gradients_len: 4B]
-        header = struct.pack('!IBH', len(metadata_bytes), int(is_compressed), len(gradients_bytes))
+        header = struct.pack('!IBI', len(metadata_bytes), int(is_compressed), len(gradients_bytes))
         sock.sendall(header)
         sock.sendall(metadata_bytes)
         sock.sendall(gradients_bytes)
@@ -150,7 +150,7 @@ def receive_message(sock, verbose=False):
         if len(header) < 9:
             raise ConnectionError("Conexión cerrada por servidor")
         
-        metadata_len, is_compressed, gradients_len = struct.unpack('!IBH', header)
+        metadata_len, is_compressed, gradients_len = struct.unpack('!IBI', header)
         
         # Recibir metadata
         metadata_bytes = b''
