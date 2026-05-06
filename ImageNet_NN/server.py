@@ -108,41 +108,14 @@ class DistributedTrainingServer:
         self.worker_connected = {}
         
         # Datos sobre particiones
-        self.shard_sizes = self._calculate_shard_sizes()
+        self.shard_sizes = 1000
         
         # Historial de checkpoints
         self.historial_intervalo_epochs = []
         self.historial_intervalo_times = []
         self.historial_intervalo_loss = []
     
-    def _calculate_shard_sizes(self) -> Dict[int, int]:
-        """
-        Calcula el tamaño de shard para cada worker.
-        
-        ImageNet train tiene 1,281,167 imágenes.
-        Se distribuyen equitativamente entre workers.
-        
-        Retorna:
-            Dict[worker_id] = tamaño_shard
-        """
-        total_size = self.total_dataset_size
-        shard_sizes = {}
-        
-        size_per_worker = total_size // self.num_workers
-        remaining = total_size % self.num_workers
-        
-        for worker_id in range(self.num_workers):
-            # Los primeros 'remaining' workers reciben un elemento extra
-            shard_sizes[worker_id] = size_per_worker + (1 if worker_id < remaining else 0)
-        
-        print(f"\n  Distribución de shards:")
-        print(f"  Total dataset size: {total_size:,} imágenes")
-        print(f"  Shards por worker:")
-        for w_id, size in shard_sizes.items():
-            print(f"    Worker {w_id}: {size:,} imágenes (~{size // BATCH_SIZE} batches @ batch_size={BATCH_SIZE})")
-        
-        return shard_sizes
-    
+
     def setup_socket_server(self):
         """Configura el socket servidor."""
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -190,7 +163,7 @@ class DistributedTrainingServer:
             try:
                 # Crear mensaje de sincronización (epoch=0, init_signal=True)
                 params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
-                shard_size = self.shard_sizes[worker_id]
+                shard_size = self.shard_sizes
                 
                 message = MessageFromServer(
                     batch_ids=[],
@@ -243,7 +216,7 @@ class DistributedTrainingServer:
         for worker_id in range(self.num_workers):
             try:
                 # Calcular número de batches según shard_size
-                shard_size = self.shard_sizes[worker_id]
+                shard_size = self.shard_sizes
                 num_batches = shard_size // BATCH_SIZE
                 batch_ids = list(range(num_batches))
                 
