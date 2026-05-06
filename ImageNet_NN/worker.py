@@ -18,6 +18,9 @@ El worker:
 
 =============================================================================
 """
+import os
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
 
 import sys
 import os
