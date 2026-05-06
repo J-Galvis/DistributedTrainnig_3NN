@@ -92,6 +92,9 @@ class DistributedTrainingWorker:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(SOCKET_TIMEOUT)
             self.socket.connect((self.server_host, self.server_port))
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2097152)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
             print(f"  ✓ Conectado al servidor exitosamente")
             
         except ConnectionRefusedError:

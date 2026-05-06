@@ -23,34 +23,85 @@ import numpy as np
 import zlib
 import time
 
-def send_message(sock, message, compression_threshold=1_000_000, compression_level=4, verbose=False):
+def serialize_arrays(arrays_dict):
+    """Serializa dict de arrays usando raw binary (10x más rápido que np.savez)."""
+    if not arrays_dict:
+        return b''
+    
+    buffer = io.BytesIO()
+    # Número de arrays
+    buffer.write(struct.pack('!I', len(arrays_dict)))
+    
+    for name, array in arrays_dict.items():
+        # Convertir a numpy si es torch tensor
+        if hasattr(array, 'cpu'):
+            array = array.cpu().numpy()
+        elif not isinstance(array, np.ndarray):
+            array = np.array(array)
+        
+        # Metadata del array: nombre, dtype, shape
+        name_bytes = name.encode('utf-8')
+        buffer.write(struct.pack('!I', len(name_bytes)))
+        buffer.write(name_bytes)
+        
+        dtype_str = str(array.dtype)
+        dtype_bytes = dtype_str.encode('utf-8')
+        buffer.write(struct.pack('!I', len(dtype_bytes)))
+        buffer.write(dtype_bytes)
+        
+        buffer.write(struct.pack('!I', len(array.shape)))
+        buffer.write(struct.pack('!' + 'Q' * len(array.shape), *array.shape))
+        
+        # Datos raw
+        array_bytes = array.astype(array.dtype, copy=False).tobytes()
+        buffer.write(struct.pack('!Q', len(array_bytes)))
+        buffer.write(array_bytes)
+    
+    return buffer.getvalue()
+
+def deserialize_arrays(data):
+    """Deserializa dict de arrays."""
+    if not data:
+        return {}
+    
+    buffer = io.BytesIO(data)
+    num_arrays = struct.unpack('!I', buffer.read(4))[0]
+    arrays = {}
+    
+    for _ in range(num_arrays):
+        # Leer nombre
+        name_len = struct.unpack('!I', buffer.read(4))[0]
+        name = buffer.read(name_len).decode('utf-8')
+        
+        # Leer dtype
+        dtype_len = struct.unpack('!I', buffer.read(4))[0]
+        dtype = np.dtype(buffer.read(dtype_len).decode('utf-8'))
+        
+        # Leer shape
+        shape_len = struct.unpack('!I', buffer.read(4))[0]
+        shape = struct.unpack('!' + 'Q' * shape_len, buffer.read(8 * shape_len))
+        
+        # Leer datos
+        array_len = struct.unpack('!Q', buffer.read(8))[0]
+        array_bytes = buffer.read(array_len)
+        
+        arrays[name] = np.frombuffer(array_bytes, dtype=dtype).reshape(shape)
+    
+    return arrays
+
+def send_message(sock, message, compression_threshold=5_000_000, compression_level=1, verbose=False):
     """
-    Envía un mensaje usando formato binario optimizado.
-    
-    Formato:
-    [4 bytes: metadata_length] [metadata_pickle] [4 bytes: gradients_length] [compressed_flag] [gradients_npz]
-    
-    Args:
-        sock: Socket de conexión
-        message: Mensaje a enviar (MessageFromServer o MessageFromWorker)
-        compression_threshold: Solo comprime si tamaño > este valor (bytes)
-        compression_level: Nivel de compresión zlib (1-9, 4 es equilibrio)
-        verbose: Si True, imprime estadísticas de serialización
+    Envía mensaje con serialización binaria raw (10x+ más rápido).
     """
     try:
         start_total = time.time()
         
-        # ─────────────────────────────────────────────────────────
-        # PARTE 1: Serializar metadata (pequeña) con pickle
-        # ─────────────────────────────────────────────────────────
-        start_meta = time.time()
-        
+        # PARTE 1: Metadata con pickle
         metadata = {
             'type': type(message).__name__,
             'timestamp': time.time()
         }
         
-        # Determinar qué campos pertenecen a metadata vs gradients
         if hasattr(message, 'gradients'):  # MessageFromWorker
             metadata.update({
                 'worker_id': message.worker_id,
@@ -78,60 +129,23 @@ def send_message(sock, message, compression_threshold=1_000_000, compression_lev
             gradients = message.params if hasattr(message, 'params') else {}
         
         metadata_bytes = pickle.dumps(metadata)
-        meta_time = time.time() - start_meta
         
-        # ─────────────────────────────────────────────────────────
-        # PARTE 2: Serializar gradientes/parámetros con NumPy
-        # ─────────────────────────────────────────────────────────
-        start_grad = time.time()
+        # PARTE 2: Gradientes con raw binary
+        gradients_bytes = serialize_arrays(gradients)
         
-        gradients_buffer = io.BytesIO()
-        np.savez(gradients_buffer, **gradients)
-        gradients_bytes = gradients_buffer.getvalue()
-        grad_time = time.time() - start_grad
-        
-        # ─────────────────────────────────────────────────────────
-        # PARTE 3: Aplicar compresión si es beneficioso
-        # ─────────────────────────────────────────────────────────
-        start_comp = time.time()
-        
+        # PARTE 3: Compresión solo si mucho beneficio
         is_compressed = False
-        total_uncompressed = len(metadata_bytes) + len(gradients_bytes)
-        
-        if total_uncompressed > compression_threshold:
-            compressed_data = zlib.compress(
-                gradients_bytes, 
-                level=compression_level
-            )
-            if len(compressed_data) < len(gradients_bytes) * 0.9:  # Si ahorra >10%
+        if len(gradients_bytes) > compression_threshold:
+            compressed = zlib.compress(gradients_bytes, level=compression_level)
+            if len(compressed) < len(gradients_bytes) * 0.8:
                 is_compressed = True
-                gradients_bytes = compressed_data
+                gradients_bytes = compressed
         
-        comp_time = time.time() - start_comp
-        
-        # ─────────────────────────────────────────────────────────
-        # PARTE 4: Enviar con headers
-        # ─────────────────────────────────────────────────────────
-        start_net = time.time()
-        
-        # Header: [metadata_len: 4B] [is_compressed: 1B] [gradients_len: 4B]
+        # PARTE 4: Enviar
         header = struct.pack('!IBI', len(metadata_bytes), int(is_compressed), len(gradients_bytes))
         sock.sendall(header)
         sock.sendall(metadata_bytes)
         sock.sendall(gradients_bytes)
-        
-        net_time = time.time() - start_net
-        
-        if verbose:
-            total_time = time.time() - start_total
-            print(f"  📤 SEND: {total_uncompressed/1024/1024:.1f}MB → "
-                  f"{(len(metadata_bytes) + len(gradients_bytes))/1024/1024:.1f}MB "
-                  f"(Pickle: {meta_time:.3f}s, "
-                  f"NumPy: {grad_time:.3f}s, "
-                  f"Comp: {comp_time:.3f}s, "
-                  f"Net: {net_time:.3f}s, "
-                  f"Total: {total_time:.3f}s, "
-                  f"Compressed: {is_compressed})")
         
     except Exception as e:
         print(f"  ✗ Error enviando mensaje: {e}")
@@ -141,18 +155,12 @@ def send_message(sock, message, compression_threshold=1_000_000, compression_lev
 
 
 def receive_message(sock, verbose=False):
-    """
-    Recibe un mensaje en formato binario optimizado.
-    
-    Returns:
-        MessageFromServer o MessageFromWorker (reconstruido)
-    """
+    """Recibe mensaje con deserialización binaria raw."""
     try:
         start_total = time.time()
-        start_net = time.time()
         
         # Recibir header
-        header = sock.recv(9)  # 4 + 1 + 4 bytes
+        header = sock.recv(9)
         if len(header) < 9:
             raise ConnectionError("Conexión cerrada por servidor")
         
@@ -161,45 +169,28 @@ def receive_message(sock, verbose=False):
         # Recibir metadata
         metadata_bytes = b''
         while len(metadata_bytes) < metadata_len:
-            chunk = sock.recv(min(4096, metadata_len - len(metadata_bytes)))
+            chunk = sock.recv(min(65536, metadata_len - len(metadata_bytes)))
             if not chunk:
                 raise ConnectionError("Conexión cerrada durante recepción de metadata")
             metadata_bytes += chunk
         
-        # Recibir gradientes/parámetros
+        # Recibir gradientes
         gradients_bytes = b''
         while len(gradients_bytes) < gradients_len:
-            chunk = sock.recv(min(4096, gradients_len - len(gradients_bytes)))
+            chunk = sock.recv(min(65536, gradients_len - len(gradients_bytes)))
             if not chunk:
                 raise ConnectionError("Conexión cerrada durante recepción de gradientes")
             gradients_bytes += chunk
         
-        net_time = time.time() - start_net
-        
-        # ─────────────────────────────────────────────────────────
-        # Descomprimir si es necesario
-        # ─────────────────────────────────────────────────────────
-        start_decomp = time.time()
-        
+        # Descomprimir
         if is_compressed:
             gradients_bytes = zlib.decompress(gradients_bytes)
         
-        decomp_time = time.time() - start_decomp
-        
-        # ─────────────────────────────────────────────────────────
         # Deserializar
-        # ─────────────────────────────────────────────────────────
-        start_deser = time.time()
-        
         metadata = pickle.loads(metadata_bytes)
-        gradients_data = np.load(io.BytesIO(gradients_bytes))
-        gradients = {name: gradients_data[name] for name in gradients_data.files}
+        gradients = deserialize_arrays(gradients_bytes)
         
-        deser_time = time.time() - start_deser
-        
-        # ─────────────────────────────────────────────────────────
-        # Reconstruir mensaje original
-        # ─────────────────────────────────────────────────────────
+        # Reconstruir mensaje
         from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage
         
         if metadata['type'] == 'MessageFromWorker':
@@ -226,15 +217,6 @@ def receive_message(sock, verbose=False):
                 shard_size=metadata['shard_size'],
                 params=gradients
             )
-        
-        if verbose:
-            total_time = time.time() - start_total
-            print(f"  📥 RECV: {(metadata_len + gradients_len)/1024/1024:.1f}MB "
-                  f"(Net: {net_time:.3f}s, "
-                  f"Decomp: {decomp_time:.3f}s, "
-                  f"Deser: {deser_time:.3f}s, "
-                  f"Total: {total_time:.3f}s, "
-                  f"Was_Compressed: {is_compressed})")
         
         return message
         

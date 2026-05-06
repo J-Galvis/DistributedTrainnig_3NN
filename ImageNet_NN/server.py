@@ -121,6 +121,8 @@ class DistributedTrainingServer:
         """Configura el socket servidor."""
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2097152)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(self.num_workers)
         self.server_socket.settimeout(SOCKET_TIMEOUT)
@@ -142,6 +144,9 @@ class DistributedTrainingServer:
                 print(f"\n  [Esperando] Worker {worker_id}...")
                 client_socket, client_address = self.server_socket.accept()
                 client_socket.settimeout(SOCKET_TIMEOUT)
+                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2097152)
+                client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
                 
                 self.worker_sockets[worker_id] = client_socket
                 self.worker_connected[worker_id] = True
