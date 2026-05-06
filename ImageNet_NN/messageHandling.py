@@ -60,6 +60,12 @@ def send_message(sock, message, compression_threshold=1_000_000, compression_lev
                 'training_time': message.training_time,
             })
             gradients = message.gradients
+        elif hasattr(message, 'dataset_size'):  # WorkerReadyMessage
+            metadata.update({
+                'worker_id': message.worker_id,
+                'dataset_size': message.dataset_size,
+            })
+            gradients = {}
         else:  # MessageFromServer
             metadata.update({
                 'batch_ids': message.batch_ids,
@@ -194,7 +200,7 @@ def receive_message(sock, verbose=False):
         # ─────────────────────────────────────────────────────────
         # Reconstruir mensaje original
         # ─────────────────────────────────────────────────────────
-        from Protocol import MessageFromServer, MessageFromWorker
+        from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage
         
         if metadata['type'] == 'MessageFromWorker':
             message = MessageFromWorker(
@@ -204,6 +210,11 @@ def receive_message(sock, verbose=False):
                 loss=metadata['loss'],
                 accuracy=metadata['accuracy'],
                 training_time=metadata['training_time']
+            )
+        elif metadata['type'] == 'WorkerReadyMessage':
+            message = WorkerReadyMessage(
+                worker_id=metadata['worker_id'],
+                dataset_size=metadata['dataset_size']
             )
         else:  # MessageFromServer
             message = MessageFromServer(
