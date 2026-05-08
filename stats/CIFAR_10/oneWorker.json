@@ -1,6 +1,6 @@
 {
-  "nombre_modelo": "One worker Ryzen 3 4300U",
-  "fecha_guardado": "2026-03-17 14:53:09",
+  "nombre_modelo": "Ryzen 3 4300U",
+  "fecha_guardado": "2026-04-17 14:53:09",
   "precision_test": 63.52,
   "epocas": 60,
   "learning_rate": 0.1,
