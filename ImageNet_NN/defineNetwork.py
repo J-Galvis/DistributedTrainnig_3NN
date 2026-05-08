@@ -15,7 +15,7 @@ class Net(nn.Module):
         super(Net, self).__init__()
         
         # ─────────────────────────────────────────────────────────
-        # BLOQUE INICIAL
+        # BLOQUE INICIAL!
         # ─────────────────────────────────────────────────────────
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
