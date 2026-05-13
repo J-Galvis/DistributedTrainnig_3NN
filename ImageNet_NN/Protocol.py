@@ -34,6 +34,7 @@ class MessageFromServer:
     learning_rate: float
     shard_size: int
     params: Dict
+    hf_token: str  # Token de HuggingFace para acceso a ImageNet
     
     def __repr__(self):
         return (f"MessageFromServer(epoch={self.epoch}, batches={len(self.batch_ids)}, "

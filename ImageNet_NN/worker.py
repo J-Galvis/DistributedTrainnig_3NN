@@ -131,6 +131,8 @@ class DistributedTrainingWorker:
             self.shard_size = message.shard_size
             print(f"  ✓ Shard size asignado: {self.shard_size:,} imágenes")
             
+            self.hf_token = message.hf_token
+            
             # Actualizar parámetros del modelo
             self.update_model_params(message.params)
             print(f"  ✓ Parámetros del modelo actualizados")
@@ -138,6 +140,7 @@ class DistributedTrainingWorker:
             # Crear dataloader para el shard asignado
             # Para simplificar, cada worker carga todo desde el principio
             # En una implementación real, se usarían índices diferentes
+
             print(f"  ⏳ Inicializando dataloader de ImageNet ({self.imagenet_split})...")
             
             self.dataloader = get_imagenet_stream_dataloader(

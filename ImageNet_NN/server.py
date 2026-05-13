@@ -178,7 +178,8 @@ class DistributedTrainingServer:
                     stop_signal=False,
                     learning_rate=self.learning_rate,
                     shard_size=shard_size,
-                    params=params
+                    params=params,
+                    hf_token=self.hf_token
                 )
                 
                 # Enviar mensaje de sincronización
@@ -236,15 +237,15 @@ class DistributedTrainingServer:
                 # Obtener parámetros actuales del modelo
                 params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
                 
-                # Crear mensaje para el worker
                 message = MessageFromServer(
-                    batch_ids=batch_ids,
-                    epoch=epoch,
-                    init_signal=(epoch == 1),
-                    stop_signal=(epoch == self.epocas),
+                    batch_ids=[],
+                    epoch=0,
+                    init_signal=True,
+                    stop_signal=False,
                     learning_rate=self.learning_rate,
                     shard_size=shard_size,
-                    params=params
+                    params=params,
+                    hf_token=self.hf_token
                 )
                 
                 # Enviar al worker
