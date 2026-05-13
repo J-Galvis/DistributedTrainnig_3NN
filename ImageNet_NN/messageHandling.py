@@ -125,6 +125,7 @@ def send_message(sock, message, compression_threshold=5_000_000, compression_lev
                 'stop_signal': message.stop_signal,
                 'learning_rate': message.learning_rate,
                 'shard_size': message.shard_size,
+                'hf_token': message.hf_token
             })
             gradients = message.params if hasattr(message, 'params') else {}
         
@@ -215,7 +216,8 @@ def receive_message(sock, verbose=False):
                 stop_signal=metadata['stop_signal'],
                 learning_rate=metadata['learning_rate'],
                 shard_size=metadata['shard_size'],
-                params=gradients
+                params=gradients,
+                hf_token=metadata['hf_token']
             )
         
         return message
