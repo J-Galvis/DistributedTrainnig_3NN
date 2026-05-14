@@ -29,6 +29,7 @@ import torch.nn as nn
 import socket
 import time
 import argparse
+import numpy as np
 
 # Agregar el directorio padre al path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -264,7 +265,20 @@ class DistributedTrainingWorker:
         avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
         avg_accuracy = total_accuracy / num_samples if num_samples > 0 else 0.0
         
-        print(f"    ✓ Entrenamiento completado: Loss={avg_loss:.4f}, Acc={avg_accuracy:.2f}%")
+        # 🔧 FIX 1: Normalizar gradientes acumulados por número de batches
+        # Los gradientes se suman en el loop pero deben ser divididos por batch_count
+        # para evitar que tengan magnitudes enormes que causen inestabilidad en el entrenamiento
+        if batch_count > 0:
+            for name in accumulated_grads.keys():
+                accumulated_grads[name] = accumulated_grads[name] / batch_count
+        
+        # Log de depuración: verificar magnitud de gradientes
+        if accumulated_grads:
+            grad_norms = [np.linalg.norm(g.flatten()) for g in accumulated_grads.values() if g.size > 0]
+            avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+            print(f"    ℹ Gradient norm promedio: {avg_grad_norm:.6f} (normalizado por {batch_count} batches)")
+        
+        print(f"    ✓ Entrenamiento completado: Loss={avg_loss:.4f}, Acc (train)={avg_accuracy:.2f}%")
         
         return accumulated_grads, avg_loss, avg_accuracy, tiempo_entrenamiento
     

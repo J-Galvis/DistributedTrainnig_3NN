@@ -25,6 +25,7 @@ import torch.optim as optim
 import socket
 import time
 import json
+import numpy as np
 from datetime import datetime
 from typing import Dict, List
 import argparse
@@ -238,8 +239,8 @@ class DistributedTrainingServer:
                 params = {name: param.data.cpu().numpy() for name, param in self.net.named_parameters()}
                 
                 message = MessageFromServer(
-                    batch_ids=[],
-                    epoch=0,
+                    batch_ids=batch_ids,
+                    epoch=epoch,
                     init_signal=True,
                     stop_signal=False,
                     learning_rate=self.learning_rate,
@@ -290,6 +291,9 @@ class DistributedTrainingServer:
         """
         Promedia los gradientes de todos los workers.
         
+        IMPORTANTE: Los gradientes ya están normalizados por batch_count en el worker.
+        Solo necesitamos promediarlos aquí.
+        
         Retorna:
             Dict con gradientes promediados para cada parámetro
         """
@@ -305,11 +309,21 @@ class DistributedTrainingServer:
                 grads_list = [msg.gradients[param_name] for msg in messages_list]
                 avg_grads[param_name] = sum(grads_list) / num_workers
         
+        # Log de depuración: verificar magnitud de gradientes promediados
+        if avg_grads:
+            grad_norms = [np.linalg.norm(g.flatten()) for g in avg_grads.values() if g.size > 0]
+            avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+            print(f"    ℹ Server: Gradient norm promedio después de averaging: {avg_grad_norm:.6f} (across {num_workers} workers)")
+        
         return avg_grads
     
     def update_model(self, avg_grads):
         """
         Actualiza los pesos del modelo usando los gradientes promediados.
+        
+        Los gradientes llegan ya:
+        - Normalizados por batch_count desde el worker
+        - Promediados entre workers
         """
         self.optimizer.zero_grad()
         
@@ -318,8 +332,18 @@ class DistributedTrainingServer:
             if name in avg_grads:
                 param.grad = torch.tensor(avg_grads[name], dtype=param.dtype, device=param.device)
         
-        # Aplicar clipping
-        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+        # Log de depuración: verificar norma total de gradientes antes de clipping
+        total_norm = 0.0
+        for p in self.net.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        print(f"    ℹ Server: Gradient norm total ANTES de clipping: {total_norm:.6f}")
+        
+        # Aplicar clipping para evitar exploding gradients
+        clipped_norm = torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+        print(f"    ℹ Server: Gradient clipping aplicado (norm={clipped_norm:.6f})")
         
         # Actualizar pesos
         self.optimizer.step()
