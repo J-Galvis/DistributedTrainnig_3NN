@@ -1,66 +1,74 @@
 """
 =============================================================================
-  WORKER — ENTRENAMIENTO NEURAL DISTRIBUIDO CON SOCKETS
+  WORKER — ENTRENAMIENTO NEURAL DISTRIBUIDO IMAGENET CON SOCKETS
 =============================================================================
 
 El worker:
 1. Se conecta al servidor
 2. Para cada época recibe:
    - batch_ids: lista de identificadores de batches
+   - shard_size: tamaño de la porción del dataset asignada
    - params: parámetros globales del modelo
    - learning_rate
    - init_signal / stop_signal
-3. Carga los batches basados en batch_ids
+3. Carga los batches del shard de ImageNet usando streaming
 4. Entrena acumulando gradientes
 5. Envía gradientes acumulados al servidor
 6. Repite hasta recibir stop_signal
 
-El dataset se carga localmente de manera que cada worker puede acceder a cualquier batch.
 =============================================================================
 """
+import os
+os.environ['CURL_CA_BUNDLE'] = ''
+os.environ['REQUESTS_CA_BUNDLE'] = ''
 
 import sys
 import os
 import torch
 import torch.nn as nn
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 import socket
 import time
 import argparse
+import numpy as np
 
 # Agregar el directorio padre al path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from defineNetwork import Net
 from Protocol import MessageFromServer, MessageFromWorker, WorkerReadyMessage, TrainingConfig
 from messageHandling import send_message, receive_message
+from Utils.loadImageNet import get_imagenet_stream_dataloader
 
 # Configuración
 SOCKET_TIMEOUT = TrainingConfig.socket_timeout
 SERVER_HOST = TrainingConfig.server_host
 SERVER_PORT = TrainingConfig.server_port
 BATCH_SIZE = TrainingConfig.batch_size
-NUM_WORKERS = TrainingConfig.num_workers
+NUM_CLASSES = TrainingConfig.num_classes
+HF_TOKEN = TrainingConfig.hf_token
+
 
 class DistributedTrainingWorker:
     """
-    Worker de Entrenamiento Distribuido.
+    Worker de Entrenamiento Distribuido para ImageNet.
     
-    Se conecta al servidor y entrena los batches asignados.
+    Se conecta al servidor y entrena los batches asignados del shard ImageNet.
     """
     
-    def __init__(self, server_host, server_port):
+    def __init__(self, server_host, server_port, hf_token='', imagenet_split='train'):
         self.server_host = server_host
         self.server_port = server_port
+        self.hf_token = hf_token
+        self.imagenet_split = imagenet_split
         
         # Modelo
-        self.net = Net()
+        self.net = Net(num_classes=NUM_CLASSES)
         self.criterion = nn.CrossEntropyLoss()
         
         # Datos
-        self.batches = list(TRAINLOADER)
         self.worker_id = None
+        self.shard_size = None
+        self.dataloader = None
         
         # Socket
         self.socket = None
@@ -72,7 +80,7 @@ class DistributedTrainingWorker:
         # Para AMP (Automatic Mixed Precision)
         self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
         
-        print(f"Worker initialized: {len(self.batches)} batches loaded locally")
+        print(f"Worker inicializado para ImageNet ({imagenet_split})")
     
     def connect_to_server(self):
         """Se conecta al servidor."""
@@ -85,6 +93,9 @@ class DistributedTrainingWorker:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(SOCKET_TIMEOUT)
             self.socket.connect((self.server_host, self.server_port))
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2097152)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
             print(f"  ✓ Conectado al servidor exitosamente")
             
         except ConnectionRefusedError:
@@ -101,7 +112,7 @@ class DistributedTrainingWorker:
         """
         Espera el mensaje de sincronización inicial del servidor.
         
-        Actualiza los parámetros del modelo y envía confirmación.
+        Recibe shard_size y actualiza los parámetros del modelo.
         """
         print(f"\n{'='*70}")
         print(f"  ESPERANDO INICIALIZACIÓN DEL SERVIDOR")
@@ -117,14 +128,35 @@ class DistributedTrainingWorker:
             
             print(f"  ✓ Recibido mensaje de sincronización del servidor")
             
+            # Guardar shard_size
+            self.shard_size = message.shard_size
+            print(f"  ✓ Shard size asignado: {self.shard_size:,} imágenes")
+            
+            self.hf_token = message.hf_token
+            
             # Actualizar parámetros del modelo
             self.update_model_params(message.params)
             print(f"  ✓ Parámetros del modelo actualizados")
             
+            # Crear dataloader para el shard asignado
+            # Para simplificar, cada worker carga todo desde el principio
+            # En una implementación real, se usarían índices diferentes
+
+            print(f"  ⏳ Inicializando dataloader de ImageNet ({self.imagenet_split})...")
+            
+            self.dataloader = get_imagenet_stream_dataloader(
+                split=self.imagenet_split,
+                token=self.hf_token,
+                batch_size=BATCH_SIZE,
+                shard_index=0,  # Se asignará según worker_id en el servidor
+                num_shards=1,
+            )
+            print(f"  ✓ Dataloader listo")
+            
             # Enviar confirmación
             ready_msg = WorkerReadyMessage(
                 worker_id=0,  # Se asignará en el servidor
-                dataset_size=len(self.batches)
+                dataset_size=self.shard_size
             )
             send_message(self.socket, ready_msg)
             print(f"  ✓ Confirmación de listo enviada al servidor")
@@ -153,19 +185,19 @@ class DistributedTrainingWorker:
         total = labels.size(0)
         return 100 * correct / total
     
-    def train_epoch(self, batch_ids):
+    def train_epoch(self, num_batches):
         """
-        Entrena una época con los batches asignados.
+        Entrena una época procesando num_batches del dataloader.
         
         Acumula gradientes de todos los batches y computa pérdida y precisión.
         
         Parámetros:
-            batch_ids: Lista de identificadores de batches
+            num_batches: Número de batches a procesar
         
         Retorna:
             (gradients_dict, avg_loss, avg_accuracy, training_time)
         """
-        print(f"    Entrenando con {len(batch_ids)} batches...")
+        print(f"    Entrenando con {num_batches} batches de ImageNet...")
         
         tiempo_inicio = time.time()
         
@@ -175,56 +207,78 @@ class DistributedTrainingWorker:
         total_loss = 0.0
         total_accuracy = 0.0
         num_samples = 0
+        batch_count = 0
         
-        # Procesamiento de batches
-        for batch_idx in batch_ids:
-            if batch_idx >= len(self.batches):
-                print(f"    ⚠ Warning: batch_id {batch_idx} out of range ({len(self.batches)})")
-                continue
-            
-            inputs, labels = self.batches[batch_idx]
-            inputs = inputs.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-            
-            self.net.zero_grad()
-            
-            # Forward pass
-            if self.scaler is not None:
-                with torch.cuda.amp.autocast():
+        # Procesamiento de batches desde el dataloader
+        try:
+            for inputs, labels in self.dataloader:
+                if batch_count >= num_batches:
+                    break
+                
+                inputs = inputs.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                
+                self.net.zero_grad()
+                
+                # Forward pass
+                if self.scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        outputs = self.net(inputs)
+                        loss = self.criterion(outputs, labels)
+                    
+                    # Backward pass
+                    self.scaler.scale(loss).backward()
+                    
+                    # Unscale para acumulación
+                    dummy_optimizer = torch.optim.SGD(self.net.parameters(), lr=0.01)
+                    self.scaler.unscale_(dummy_optimizer)
+                else:
                     outputs = self.net(inputs)
                     loss = self.criterion(outputs, labels)
+                    loss.backward()
                 
-                # Backward pass
-                self.scaler.scale(loss).backward()
+                # Acumular gradientes
+                for name, param in self.net.named_parameters():
+                    if param.grad is not None:
+                        if name not in accumulated_grads:
+                            accumulated_grads[name] = param.grad.detach().cpu().numpy().copy()
+                        else:
+                            accumulated_grads[name] += param.grad.detach().cpu().numpy()
                 
-                # Unscale para acumulación
-                dummy_optimizer = torch.optim.SGD(self.net.parameters(), lr=0.01)
-                self.scaler.unscale_(dummy_optimizer)
-            else:
-                outputs = self.net(inputs)
-                loss = self.criterion(outputs, labels)
-                loss.backward()
-            
-            # Acumular gradientes
-            for name, param in self.net.named_parameters():
-                if param.grad is not None:
-                    if name not in accumulated_grads:
-                        accumulated_grads[name] = param.grad.detach().cpu().numpy().copy()
-                    else:
-                        accumulated_grads[name] += param.grad.detach().cpu().numpy()
-            
-            # Acumular métricas
-            total_loss += loss.item()
-            accuracy = self.compute_accuracy(outputs, labels)
-            total_accuracy += accuracy * labels.size(0)
-            num_samples += labels.size(0)
+                # Acumular métricas
+                total_loss += loss.item()
+                accuracy = self.compute_accuracy(outputs, labels)
+                total_accuracy += accuracy * labels.size(0)
+                num_samples += labels.size(0)
+                
+                batch_count += 1
+                
+                # Mostrar progreso cada 100 batches
+                if batch_count % 100 == 0:
+                    print(f"      ... {batch_count}/{num_batches} batches procesados")
+        
+        except StopIteration:
+            print(f"    ⚠ Dataloader agotado antes de {num_batches} batches ({batch_count} completados)")
         
         tiempo_entrenamiento = time.time() - tiempo_inicio
         
-        avg_loss = total_loss / len(batch_ids) if batch_ids else 0.0
+        avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
         avg_accuracy = total_accuracy / num_samples if num_samples > 0 else 0.0
         
-        print(f"    ✓ Entrenamiento completado: Loss={avg_loss:.4f}, Acc={avg_accuracy:.2f}%")
+        # 🔧 FIX 1: Normalizar gradientes acumulados por número de batches
+        # Los gradientes se suman en el loop pero deben ser divididos por batch_count
+        # para evitar que tengan magnitudes enormes que causen inestabilidad en el entrenamiento
+        if batch_count > 0:
+            for name in accumulated_grads.keys():
+                accumulated_grads[name] = accumulated_grads[name] / batch_count
+        
+        # Log de depuración: verificar magnitud de gradientes
+        if accumulated_grads:
+            grad_norms = [np.linalg.norm(g.flatten()) for g in accumulated_grads.values() if g.size > 0]
+            avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+            print(f"    ℹ Gradient norm promedio: {avg_grad_norm:.6f} (normalizado por {batch_count} batches)")
+        
+        print(f"    ✓ Entrenamiento completado: Loss={avg_loss:.4f}, Acc (train)={avg_accuracy:.2f}%")
         
         return accumulated_grads, avg_loss, avg_accuracy, tiempo_entrenamiento
     
@@ -249,8 +303,9 @@ class DistributedTrainingWorker:
                 
                 epoch_count += 1
                 
-                print(f"  ✓ Recibido: epoch={message.epoch}, init={message.init_signal}, "
-                      f"stop={message.stop_signal}, batches={len(message.batch_ids)}")
+                num_batches_to_process = len(message.batch_ids)
+                print(f"  ✓ Recibido: epoch={message.epoch}, shard_size={message.shard_size:,}, "
+                      f"batches={num_batches_to_process}, stop={message.stop_signal}")
                 
                 # ┌─── HANDSHAKE: Responder a mensaje de sincronización ───┐
                 if message.init_signal and message.epoch == 0:
@@ -262,8 +317,8 @@ class DistributedTrainingWorker:
                 self.update_model_params(message.params)
                 print(f"    → Parámetros del modelo actualizados (epoch {message.epoch})")
                 
-                # Entrenar
-                gradients, loss, accuracy, train_time = self.train_epoch(message.batch_ids)
+                # Entrenar con los batches asignados
+                gradients, loss, accuracy, train_time = self.train_epoch(num_batches_to_process)
                 
                 # Crear respuesta
                 response = MessageFromWorker(
@@ -304,6 +359,125 @@ class DistributedTrainingWorker:
                 self.socket.close()
             except:
                 pass
+
+
+def start_worker(server_host, server_port, hf_token, imagenet_split):
+    """Inicia el worker de entrenamiento distribuido"""
+    worker = DistributedTrainingWorker(server_host, server_port, hf_token, imagenet_split)
+    
+    try:
+        worker.connect_to_server()
+        worker.wait_for_initialization()
+        worker.training_loop()
+    
+    except Exception as e:
+        print(f"\n✗ Error en worker: {e}")
+    finally:
+        worker.shutdown()
+        print("\nWorker desconectado")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Worker para entrenamiento distribuido de ImageNet."
+    )
+
+    parser.add_argument(
+        "--host",
+        "-H",
+        default=SERVER_HOST,
+        help=f"Host del servidor (por defecto: {SERVER_HOST})",
+    )
+    parser.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=SERVER_PORT,
+        help=f"Puerto del servidor (por defecto: {SERVER_PORT})",
+    )
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=HF_TOKEN,
+        help="Token de HuggingFace para acceso a ImageNet",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default='train',
+        choices=['train', 'val'],
+        help="Split de ImageNet a usar (por defecto: train)",
+    )
+
+    args = parser.parse_args()
+
+    start_worker(args.host, args.port, args.hf_token, args.split)
+    
+    epoch_count = 0
+    
+    while True:
+        try:
+            # Recibir mensaje del servidor
+            print(f"  [Worker] Esperando mensaje del servidor...")
+            message = receive_message(self.socket)
+            
+            epoch_count += 1
+            
+            print(f"  ✓ Recibido: epoch={message.epoch}, init={message.init_signal}, "
+                f"stop={message.stop_signal}, batches={len(message.batch_ids)}")
+            
+            # ┌─── HANDSHAKE: Responder a mensaje de sincronización ───┐
+            if message.init_signal and message.epoch == 0:
+                # Ya manejado en wait_for_initialization
+                continue
+            # └─────────────────────────────────────────────────┘
+            
+            # Actualizar parámetros del modelo
+            self.update_model_params(message.params)
+            print(f"    → Parámetros del modelo actualizados (epoch {message.epoch})")
+            
+            # Entrenar
+            gradients, loss, accuracy, train_time = self.train_epoch(message.batch_ids)
+            
+            # Crear respuesta
+            response = MessageFromWorker(
+                worker_id=0,
+                epoch=message.epoch,
+                gradients=gradients,
+                loss=loss,
+                accuracy=accuracy,
+                training_time=train_time
+            )
+            
+            # Enviar gradientes
+            print(f"    → Enviando gradientes...")
+            send_message(self.socket, response)
+            print(f"    ✓ Gradientes enviados")
+            
+            # Verificar stop signal
+            if message.stop_signal:
+                print(f"\n  ✓ Stop signal recibido. Terminando worker.")
+                break
+            
+        except ConnectionError as e:
+            print(f"\n  ✗ Conexión perdida con servidor: {e}")
+            break
+        except socket.timeout:
+            print(f"\n  ✗ Timeout esperando mensaje del servidor")
+            break
+        except Exception as e:
+            print(f"\n  ✗ Error en bucle de entrenamiento: {e}")
+            import traceback
+            traceback.print_exc()
+            break
+
+def shutdown(self):
+    """Cierra la conexión."""
+    if self.socket:
+        try:
+            self.socket.close()
+        except:
+            pass
 
 
 def start_worker():
